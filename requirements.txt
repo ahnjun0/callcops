@@ -1,0 +1,44 @@
+# CallCops: Real-Time Audio Watermarking
+# ============================================
+# Python >= 3.10 required (Performance optimizations)
+
+# Core dependencies
+torch>=2.4.0             # Improved MPS support (Mac) & torch.compile
+torchaudio>=2.4.0
+numpy>=1.26.0
+
+# Configuration
+pyyaml>=6.0
+
+# Training & Logging
+tensorboard>=2.10.0
+tqdm>=4.64.0
+
+# Audio processing
+scipy>=1.9.0
+librosa>=0.10.0
+
+# Evaluation (optional but recommended)
+pesq>=0.0.4              # PESQ metric
+pystoi>=0.3.3            # STOI metric
+
+# Data handling
+soundfile>=0.12.0
+
+# Mobile export (optional)
+onnx>=1.14.0             # ONNX export
+onnxruntime>=1.15.0      # ONNX runtime
+
+# Development
+black>=23.0.0            # Code formatting
+isort>=5.12.0            # Import sorting
+pytest>=7.4.0            # Testing
+pytest-cov>=4.1.0        # Coverage
+
+# Jupyter (optional)
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0

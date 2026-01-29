@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+.venv/
+env/
+.env
+
+# MacOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Project Outputs & Artifacts
+# Checkpoints (Model weights)
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Exported Models (Mobile)
+exported/*
+!exported/.gitkeep
+
+# Logs (TensorBoard)
+logs/*
+!logs/.gitkeep
+
+# Results (Evaluation outputs)
+results/
+
+# Data (Datasets)
+# Ignore all content in data directory recursively
+data/**
+# But do NOT ignore directories (allow traversing)
+!data/**/
+# And explicitly keep .gitkeep files
+!data/**/.gitkeep
+
+# Common Audio Formats (to prevent accidental commits outside data/)
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.pt
+*.pth
+*.onnx
+*.ptl
+
+# Temporary files
+tmp/
+temp/

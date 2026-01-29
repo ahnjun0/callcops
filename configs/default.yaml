@@ -1,0 +1,67 @@
+# CallCops: Real-Time Audio Watermarking Configuration
+# ==========================================================
+# 한국어 상담 데이터 (8kHz) 최적화 설정
+
+# 오디오 규격
+audio:
+  sample_rate: 8000          # 8kHz (전화망 표준)
+  bit_depth: 16              # 16-bit PCM
+  channels: 1                # Mono
+  frame_ms: 40               # 40ms 프레임 (320 samples @ 8kHz)
+  frame_samples: 320         # 8000 * 0.040 = 320
+
+# 워터마크 페이로드
+watermark:
+  bits_per_frame: 1          # 프레임당 1-bit 삽입
+  payload_length: 128        # 128-bit Cyclic Payload
+  sync_pattern: "1010101010101010"  # 16-bit 동기화 패턴
+
+# 모델 아키텍처
+model:
+  encoder:
+    channels: [32, 64, 128, 256]      # Causal Conv 채널
+    kernel_size: 7                     # 컨볼루션 커널 크기
+    dilation_base: 2                   # Dilation 증가 배수
+    num_layers: 8                      # 총 레이어 수
+    attention_heads: 4                 # Attention 헤드 수
+
+  decoder:
+    channels: [256, 128, 64, 32]      # 역순 채널
+    kernel_size: 5
+
+  discriminator:
+    resolutions: [64, 128, 256]       # Multi-Resolution scales
+    channels: [32, 64, 128, 256]
+
+# 학습 설정
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  adam_betas: [0.5, 0.9]
+  epochs: 100
+  grad_clip: 1.0
+
+  # 손실 함수 가중치
+  lambda_bit: 1.0            # L_BCE (비트 정확도)
+  lambda_audio: 10.0         # L_Mel (음질 보존)
+  lambda_adv: 0.1            # L_GAN (자연스러움)
+  lambda_codec: 5.0          # Codec robustness
+
+# 코덱 시뮬레이터
+codec:
+  types: ["g711_alaw", "g711_ulaw", "g729"]
+  g711_bits: 8               # 8-bit 양자화
+  g729_bitrate: 8000         # 8kbps
+
+# 데이터 증강
+augmentation:
+  noise_snr_range: [15, 40]  # dB
+  bandpass_low: 300          # Hz (전화망 대역)
+  bandpass_high: 3400        # Hz
+  codec_prob: 0.7            # 코덱 적용 확률
+
+# 품질 목표
+quality_targets:
+  pesq_min: 4.0              # PESQ >= 4.0
+  ber_max: 0.05              # BER < 5%
+  latency_max_ms: 200        # 실시간 요구사항
