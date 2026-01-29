@@ -14,13 +14,15 @@ Real-Time Audio Watermarking 모델 학습 스크립트.
 - BER < 5%
 
 Usage:
-    python scripts/train.py --epochs 100 --batch_size 32
-    python scripts/train.py --config configs/default.yaml --resume checkpoints/best_model.pth
+    python scripts/train.py --epochs 100 --batch_size 64
+    python scripts/train.py --config configs/default.yaml --resume checkpoints/latest.pth
 """
 
 import os
 import sys
 import argparse
+import traceback
+import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
@@ -38,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models import CallCopsNet, CallCopsLoss, DifferentiableCodecSimulator
 from scripts.dataset import create_train_val_loaders, create_dataloader
+from utils.messenger import CallCopsMessenger
 
 
 # =============================================================================
@@ -107,7 +110,8 @@ class CallCopsTrainer:
         device: torch.device,
         codec_sim: Optional[DifferentiableCodecSimulator] = None,
         grad_clip: float = 1.0,
-        use_amp: bool = False
+        use_amp: bool = False,
+        messenger: Optional[CallCopsMessenger] = None
     ):
         self.model = model
         self.loss_fn = loss_fn
@@ -117,6 +121,7 @@ class CallCopsTrainer:
         self.codec_sim = codec_sim
         self.grad_clip = grad_clip
         self.use_amp = use_amp
+        self.messenger = messenger
 
         # Mixed precision scaler
         self.scaler = GradScaler() if use_amp else None
@@ -125,6 +130,13 @@ class CallCopsTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_ber = 1.0
+        self.best_loss = float('inf')
+        
+        # 학습 이력 (Plot팅용)
+        self.history = {
+            'train_loss': [], 'val_loss': [],
+            'train_ber': [], 'val_ber': []
+        }
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """
@@ -136,9 +148,6 @@ class CallCopsTrainer:
         audio = batch['audio'].to(self.device)
         bits = batch['bits'].to(self.device)
 
-        # AMP Context Manager
-        # use_amp가 False면 autocast는 아무 효과 없음 (no-op)
-        
         # ========================================
         # 1. Discriminator Update
         # ========================================
@@ -165,6 +174,7 @@ class CallCopsTrainer:
                 self.grad_clip
             )
             self.scaler.step(self.opt_d)
+            # scaler.update()는 Generator까지 다 끝난 후 한 번만 호출
         else:
             d_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -357,7 +367,8 @@ class CallCopsTrainer:
         self,
         path: Path,
         metrics: Dict[str, float],
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        is_latest: bool = False
     ):
         """체크포인트 저장"""
         checkpoint = {
@@ -367,7 +378,9 @@ class CallCopsTrainer:
             'opt_g_state_dict': self.opt_g.state_dict(),
             'opt_d_state_dict': self.opt_d.state_dict(),
             'best_ber': self.best_ber,
-            'metrics': metrics
+            'best_loss': self.best_loss,
+            'metrics': metrics,
+            'history': self.history
         }
 
         if config is not None:
@@ -375,9 +388,23 @@ class CallCopsTrainer:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, path)
+        print(f"Saved checkpoint to {path}")
+        
+        # Save latest link (or copy)
+        if is_latest:
+            latest_path = path.parent / "latest.pth"
+            try:
+                # 덮어쓰기 위해 기존 파일 삭제
+                if latest_path.exists():
+                    latest_path.unlink()
+                # 복사가 더 안정적일 수 있음 (특히 파일시스템에 따라)
+                shutil.copy(path, latest_path)
+            except Exception as e:
+                print(f"Warning: Failed to create latest.pth: {e}")
 
     def load_checkpoint(self, path: Path):
         """체크포인트 로드"""
+        print(f"Loading checkpoint from {path}...")
         checkpoint = torch.load(path, map_location=self.device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -386,6 +413,8 @@ class CallCopsTrainer:
         self.current_epoch = checkpoint['epoch'] + 1
         self.global_step = checkpoint['global_step']
         self.best_ber = checkpoint.get('best_ber', 1.0)
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
+        self.history = checkpoint.get('history', self.history)
 
         print(f"Loaded checkpoint from epoch {checkpoint['epoch']+1}")
         print(f"Best BER: {self.best_ber:.4f}")
@@ -407,161 +436,205 @@ def train(
 ):
     """
     메인 학습 함수
-
-    Args:
-        train_loader: 학습 DataLoader
-        val_loader: 검증 DataLoader
-        config: 설정 딕셔너리
-        save_dir: 체크포인트 저장 디렉토리
-        device: 디바이스
-        resume_path: 재개할 체크포인트 경로
     """
-    # ========================================
-    # 1. Model 초기화
-    # ========================================
-    training_config = config.get('training', {})
-    model_config = config.get('model', {})
+    # 0. 메신저 초기화
+    messenger = CallCopsMessenger()
+    messenger.send_message(f"🚀 **CallCops Training Started**\nDevice: {device}\nSave Dir: `{save_dir}`")
 
-    model = CallCopsNet(
-        message_dim=config.get('watermark', {}).get('payload_length', 128),
-        hidden_channels=model_config.get('hidden_channels', [32, 64, 128, 256]),
-        num_residual_blocks=model_config.get('num_residual_blocks', 4),
-        use_discriminator=True
-    ).to(device)
+    try:
+        # ========================================
+        # 1. Model 초기화
+        # ========================================
+        training_config = config.get('training', {})
+        model_config = config.get('model', {})
 
-    # 파라미터 수 출력
-    params = model.count_parameters()
-    print(f"\nModel Parameters:")
-    print(f"  Encoder: {params['encoder']:,}")
-    print(f"  Decoder: {params['decoder']:,}")
-    print(f"  Discriminator: {params['discriminator']:,}")
-    print(f"  Total: {params['total']:,}")
-
-    # ========================================
-    # 2. Loss Function
-    # ========================================
-    loss_fn = CallCopsLoss(
-        lambda_bit=training_config.get('lambda_bit', 1.0),
-        lambda_audio=training_config.get('lambda_audio', 10.0),
-        lambda_adv=training_config.get('lambda_adv', 0.1),
-        lambda_det=training_config.get('lambda_det', 0.5),
-        lambda_stft=training_config.get('lambda_stft', 2.0),
-        sample_rate=config.get('audio', {}).get('sample_rate', 8000)
-    ).to(device)
-
-    # ========================================
-    # 3. Optimizers (LR: 2e-4)
-    # ========================================
-    lr = training_config.get('learning_rate', 2e-4)
-    betas = tuple(training_config.get('adam_betas', [0.5, 0.9]))
-
-    opt_g = optim.Adam(
-        list(model.encoder.parameters()) + list(model.decoder.parameters()),
-        lr=lr,
-        betas=betas
-    )
-
-    opt_d = optim.Adam(
-        model.discriminator.parameters(),
-        lr=lr,
-        betas=betas
-    )
-
-    # ========================================
-    # 4. Codec Simulator (Optional)
-    # ========================================
-    codec_sim = None
-    codec_config = config.get('codec', {})
-    if codec_config.get('enabled', False):
-        codec_sim = DifferentiableCodecSimulator(
-            codec_types=codec_config.get('types', ['g711_alaw', 'g729', 'none']),
-            curriculum_epochs=training_config.get('curriculum_epochs', 10)
+        model = CallCopsNet(
+            message_dim=config.get('watermark', {}).get('payload_length', 128),
+            hidden_channels=model_config.get('hidden_channels', [32, 64, 128, 256]),
+            num_residual_blocks=model_config.get('num_residual_blocks', 4),
+            use_discriminator=True
         ).to(device)
 
-    # ========================================
-    # 5. Trainer
-    # ========================================
-    trainer = CallCopsTrainer(
-        model=model,
-        loss_fn=loss_fn,
-        opt_g=opt_g,
-        opt_d=opt_d,
-        device=device,
-        codec_sim=codec_sim,
-        grad_clip=training_config.get('grad_clip', 1.0),
-        use_amp=training_config.get('use_amp', False)
-    )
+        # 파라미터 수 출력
+        params = model.count_parameters()
+        print(f"\nModel Parameters:")
+        print(f"  Encoder: {params['encoder']:,}")
+        print(f"  Decoder: {params['decoder']:,}")
+        print(f"  Discriminator: {params['discriminator']:,}")
+        print(f"  Total: {params['total']:,}")
 
-    # 체크포인트 복원
-    if resume_path and resume_path.exists():
-        trainer.load_checkpoint(resume_path)
+        # ========================================
+        # 2. Loss Function
+        # ========================================
+        loss_fn = CallCopsLoss(
+            lambda_bit=training_config.get('lambda_bit', 1.0),
+            lambda_audio=training_config.get('lambda_audio', 10.0),
+            lambda_adv=training_config.get('lambda_adv', 0.1),
+            lambda_det=training_config.get('lambda_det', 0.5),
+            lambda_stft=training_config.get('lambda_stft', 2.0),
+            sample_rate=config.get('audio', {}).get('sample_rate', 8000)
+        ).to(device)
 
-    # ========================================
-    # 6. Training Loop
-    # ========================================
-    num_epochs = training_config.get('epochs', 100)
-    save_dir.mkdir(parents=True, exist_ok=True)
+        # ========================================
+        # 3. Optimizers (LR: 2e-4)
+        # ========================================
+        lr = training_config.get('learning_rate', 2e-4)
+        betas = tuple(training_config.get('adam_betas', [0.5, 0.9]))
 
-    print("\n" + "=" * 60)
-    print("CallCops Training Started")
-    print("=" * 60)
-    print(f"  Device: {device}")
-    print(f"  Epochs: {num_epochs}")
-    print(f"  Batch size: {config.get('training', {}).get('batch_size', 32)}")
-    print(f"  Learning rate: {lr}")
-    print(f"  Training samples: {len(train_loader.dataset)}")
-    print(f"  Validation samples: {len(val_loader.dataset)}")
-    print(f"  Codec simulation: {'Enabled' if codec_sim else 'Disabled'}")
-    print("=" * 60 + "\n")
+        opt_g = optim.Adam(
+            list(model.encoder.parameters()) + list(model.decoder.parameters()),
+            lr=lr,
+            betas=betas
+        )
 
-    for epoch in range(trainer.current_epoch, num_epochs):
-        # Train
-        train_metrics = trainer.train_epoch(train_loader, epoch, num_epochs)
+        opt_d = optim.Adam(
+            model.discriminator.parameters(),
+            lr=lr,
+            betas=betas
+        )
 
-        # Validate
-        val_metrics = trainer.validate(val_loader)
+        # ========================================
+        # 4. Codec Simulator (Optional)
+        # ========================================
+        codec_sim = None
+        codec_config = config.get('codec', {})
+        if codec_config.get('enabled', False):
+            codec_sim = DifferentiableCodecSimulator(
+                codec_types=codec_config.get('types', ['g711_alaw', 'g729', 'none']),
+                curriculum_epochs=training_config.get('curriculum_epochs', 10)
+            ).to(device)
 
-        # Summary
-        print(f"\nEpoch {epoch+1}/{num_epochs} Summary:")
-        print(f"  Train - Loss: {train_metrics['loss_total']:.4f}, "
-              f"BER: {train_metrics['ber']:.4f}, SNR: {train_metrics['snr']:.1f}dB")
-        print(f"  Val   - Loss: {val_metrics['loss']:.4f}, "
-              f"BER: {val_metrics['ber']:.4f}, SNR: {val_metrics['snr']:.1f}dB")
+        # ========================================
+        # 5. Trainer
+        # ========================================
+        trainer = CallCopsTrainer(
+            model=model,
+            loss_fn=loss_fn,
+            opt_g=opt_g,
+            opt_d=opt_d,
+            device=device,
+            codec_sim=codec_sim,
+            grad_clip=training_config.get('grad_clip', 1.0),
+            use_amp=training_config.get('use_amp', True),  # AMP Enabled by default
+            messenger=messenger
+        )
 
-        # Checkpointing
-        is_best = val_metrics['ber'] < trainer.best_ber
+        # 체크포인트 복원
+        if resume_path and resume_path.exists():
+            trainer.load_checkpoint(resume_path)
+            messenger.send_message(f"🔄 **Resumed Training** from epoch {trainer.current_epoch}")
 
-        if is_best:
-            trainer.best_ber = val_metrics['ber']
-            trainer.save_checkpoint(
-                save_dir / "best_model.pth",
-                val_metrics,
-                config
+        # ========================================
+        # 6. Training Loop
+        # ========================================
+        num_epochs = training_config.get('epochs', 100)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        print("\n" + "=" * 60)
+        print("CallCops Training Started")
+        print("=" * 60)
+        print(f"  Device: {device}")
+        print(f"  Epochs: {num_epochs}")
+        print(f"  Batch size: {config.get('training', {}).get('batch_size', 64)}")
+        print(f"  Learning rate: {lr}")
+        print(f"  Training samples: {len(train_loader.dataset)}")
+        print(f"  Validation samples: {len(val_loader.dataset)}")
+        print(f"  Codec simulation: {'Enabled' if codec_sim else 'Disabled'}")
+        print("=" * 60 + "\n")
+
+        for epoch in range(trainer.current_epoch, num_epochs):
+            # Train
+            train_metrics = trainer.train_epoch(train_loader, epoch, num_epochs)
+
+            # Validate
+            val_metrics = trainer.validate(val_loader)
+
+            # Update History
+            trainer.history['train_loss'].append(train_metrics['loss_total'])
+            trainer.history['val_loss'].append(val_metrics['loss'])
+            trainer.history['train_ber'].append(train_metrics['ber'])
+            trainer.history['val_ber'].append(val_metrics['ber'])
+
+            # Summary
+            summary_text = (
+                f"✅ **Epoch {epoch+1}/{num_epochs}**\n"
+                f"📉 Train Loss: `{train_metrics['loss_total']:.4f}`\n"
+                f"📉 Val Loss: `{val_metrics['loss']:.4f}`\n"
+                f"🎯 **Val BER**: `{val_metrics['ber']:.4f}`\n"
+                f"🔊 Val SNR: `{val_metrics['snr']:.1f}dB`"
             )
-            print(f"  ★ New best model! BER: {trainer.best_ber:.4f}")
+            
+            print(f"\n{summary_text.replace('**', '').replace('`', '')}")
 
-        # 주기적 저장 (10 에포크마다)
-        if (epoch + 1) % 10 == 0:
+            # Send Notification
+            if messenger:
+                messenger.send_message(f"{summary_text}\n\n{messenger.get_system_info()}")
+
+                # Send Plot every 10 epochs
+                if (epoch + 1) % 10 == 0:
+                    messenger.send_plot(trainer.history, title=f"Training Status (Epoch {epoch+1})")
+
+            # Save Latest Checkpoint (매 에포크마다)
             trainer.save_checkpoint(
                 save_dir / f"checkpoint_epoch{epoch+1}.pth",
                 val_metrics,
-                config
+                config,
+                is_latest=True
             )
 
-        print()
+            # 1. Best BER Model
+            is_best_ber = val_metrics['ber'] < trainer.best_ber
+            if is_best_ber:
+                trainer.best_ber = val_metrics['ber']
+                trainer.save_checkpoint(
+                    save_dir / "best_ber_model.pth",
+                    val_metrics,
+                    config
+                )
+                print(f"  ★ New best BER model! BER: {trainer.best_ber:.4f}")
+                if messenger:
+                    messenger.send_message(f"🏆 **New Best BER!** `{trainer.best_ber:.4f}`")
 
-    # 최종 저장
-    trainer.save_checkpoint(
-        save_dir / "final_model.pth",
-        val_metrics,
-        config
-    )
+            # 2. Best Loss Model
+            is_best_loss = val_metrics['loss'] < trainer.best_loss
+            if is_best_loss:
+                trainer.best_loss = val_metrics['loss']
+                trainer.save_checkpoint(
+                    save_dir / "best_loss_model.pth",
+                    val_metrics,
+                    config
+                )
+                print(f"  ★ New best Loss model! Loss: {trainer.best_loss:.4f}")
 
-    print("=" * 60)
-    print("Training Completed!")
-    print(f"Best BER: {trainer.best_ber:.4f}")
-    print(f"Checkpoints saved to: {save_dir}")
-    print("=" * 60)
+            # 주기적 영구 저장 (10 에포크마다 별도 파일로 남김)
+            if (epoch + 1) % 10 == 0:
+                print(f"  Creating permanent checkpoint for epoch {epoch+1}...")
+                # save_checkpoint에서 이미 저장했으므로 별도 작업 불필요
+
+            print()
+
+        # 최종 저장
+        trainer.save_checkpoint(
+            save_dir / "final_model.pth",
+            val_metrics,
+            config
+        )
+
+        print("=" * 60)
+        print("Training Completed!")
+        print(f"Best BER: {trainer.best_ber:.4f}")
+        print(f"Checkpoints saved to: {save_dir}")
+        print("=" * 60)
+        
+        if messenger:
+            messenger.send_message(f"🎉 **Training Completed**\nBest BER: `{trainer.best_ber:.4f}`")
+
+    except Exception as e:
+        error_msg = f"❌ **Training Crashed!**\n\n```\n{traceback.format_exc()[-1000:]}\n```"
+        print(traceback.format_exc())
+        if messenger:
+            messenger.send_message(error_msg)
+        sys.exit(1)
 
 
 # =============================================================================
@@ -590,8 +663,8 @@ def main():
         help='Number of training epochs'
     )
     parser.add_argument(
-        '--batch_size', type=int, default=32,
-        help='Batch size'
+        '--batch_size', type=int, default=64,
+        help='Batch size (Default: 64 for RTX 3090)'
     )
     parser.add_argument(
         '--lr', type=float, default=2e-4,
@@ -668,7 +741,8 @@ def main():
                 'lambda_audio': 10.0,
                 'lambda_adv': 0.1,
                 'lambda_det': 0.5,
-                'lambda_stft': 2.0
+                'lambda_stft': 2.0,
+                'use_amp': True  # AMP Default
             },
             'codec': {
                 'enabled': False,
@@ -696,6 +770,16 @@ def main():
         print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     # ========================================
+    # 자동 Resume 확인
+    # ========================================
+    resume_path = args.resume
+    if resume_path is None:
+        latest_ckpt = Path("checkpoints/latest.pth")
+        if latest_ckpt.exists():
+            print(f"Found latest checkpoint: {latest_ckpt}")
+            resume_path = str(latest_ckpt)
+
+    # ========================================
     # 랜덤 시드
     # ========================================
     torch.manual_seed(args.seed)
@@ -712,7 +796,8 @@ def main():
         val_dir=args.val_dir,
         batch_size=config['training']['batch_size'],
         num_workers=args.num_workers,
-        sample_rate=config['audio']['sample_rate']
+        sample_rate=config['audio']['sample_rate'],
+        pin_memory=True  # RTX 3090 최적화
     )
 
     # ========================================
@@ -724,15 +809,13 @@ def main():
     # ========================================
     # 학습 시작
     # ========================================
-    resume_path = Path(args.resume) if args.resume else None
-
     train(
         train_loader=train_loader,
         val_loader=val_loader,
         config=config,
         save_dir=save_dir,
         device=device,
-        resume_path=resume_path
+        resume_path=Path(resume_path) if resume_path else None
     )
 
 
