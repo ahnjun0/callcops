@@ -296,7 +296,7 @@ class BitAccuracyLoss(nn.Module):
     수치적 안정성을 위해 로짓(Logit) 입력을 받아 BCEWithLogits를 계산합니다.
 
     수식:
-        L_BCE = binary_cross_entropy_with_logits(pred_logits, target_bits)
+        L_BCE = binary_cross_entropy_with_logits(pred_bits, target_bits)
 
     추가 기능:
     - Focal loss 옵션 (어려운 샘플에 집중)
@@ -317,14 +317,14 @@ class BitAccuracyLoss(nn.Module):
 
     def forward(
         self,
-        pred_logits: torch.Tensor,
+        pred_bits: torch.Tensor,
         target_bits: torch.Tensor
     ) -> torch.Tensor:
         """
         Bit accuracy loss
 
         Args:
-            pred_logits: [B, N_bits] predicted logits (before sigmoid)
+            pred_bits: [B, N_bits] predicted logits (before sigmoid)
             target_bits: [B, N_bits] target bits (0 or 1)
 
         Returns:
@@ -336,15 +336,15 @@ class BitAccuracyLoss(nn.Module):
 
         if self.use_focal:
             # Focal Loss with logits
-            # BCP with logits is more stable than sigmoid -> bce
-            bce = F.binary_cross_entropy_with_logits(pred_logits, target_bits, reduction='none')
-            pred_probs = torch.sigmoid(pred_logits)
+            # BCE with logits is more stable than sigmoid -> bce
+            bce = F.binary_cross_entropy_with_logits(pred_bits, target_bits, reduction='none')
+            pred_probs = torch.sigmoid(pred_bits)
             pt = torch.where(target_bits == 1, pred_probs, 1 - pred_probs)
             focal_weight = (1 - pt) ** self.focal_gamma
             loss = (focal_weight * bce).mean()
         else:
             # Standard BCE with logits (Stable)
-            loss = F.binary_cross_entropy_with_logits(pred_logits, target_bits)
+            loss = F.binary_cross_entropy_with_logits(pred_bits, target_bits)
 
         return loss
 
@@ -464,20 +464,20 @@ class DetectionLoss(nn.Module):
 
     def forward(
         self,
-        detection_logits: torch.Tensor,
+        detection_pred: torch.Tensor,
         has_watermark: torch.Tensor
     ) -> torch.Tensor:
         """
         Detection loss
 
         Args:
-            detection_logits: [B, 1] detection logits
+            detection_pred: [B, 1] detection logits
             has_watermark: [B, 1] ground truth (1 if watermarked)
 
         Returns:
             BCE loss
         """
-        return self.criterion(detection_logits, has_watermark)
+        return self.criterion(detection_pred, has_watermark)
 
 
 class CallCopsLoss(nn.Module):
@@ -524,9 +524,9 @@ class CallCopsLoss(nn.Module):
         self,
         pred_audio: torch.Tensor,
         target_audio: torch.Tensor,
-        pred_logits: torch.Tensor,
+        pred_bits: torch.Tensor,
         target_bits: torch.Tensor,
-        detection_logits: torch.Tensor,
+        detection_pred: torch.Tensor,
         disc_fake: Optional[List[torch.Tensor]] = None,
         disc_real: Optional[List[torch.Tensor]] = None
     ) -> dict:
@@ -536,9 +536,9 @@ class CallCopsLoss(nn.Module):
         Args:
             pred_audio: [B, 1, T] watermarked audio
             target_audio: [B, 1, T] original audio
-            pred_logits: [B, N_bits] extracted bit logits
+            pred_bits: [B, N_bits] extracted bit logits
             target_bits: [B, N_bits] original bits
-            detection_logits: [B, 1] detection logits
+            detection_pred: [B, 1] detection logits
             disc_fake: Discriminator outputs for watermarked (optional)
             disc_real: Discriminator outputs for original (optional)
 
@@ -548,7 +548,7 @@ class CallCopsLoss(nn.Module):
         losses = {}
 
         # 1. Bit Accuracy Loss (L_BCE) - Stable Logits Version
-        losses['bit'] = self.bit_loss(pred_logits, target_bits)
+        losses['bit'] = self.bit_loss(pred_bits, target_bits)
 
         # 2. Audio Quality Loss (L_Mel + L_STFT)
         losses['mel'] = self.mel_loss(pred_audio, target_audio)
@@ -559,8 +559,8 @@ class CallCopsLoss(nn.Module):
         losses['stft'] = sc_loss + mag_loss
 
         # 3. Detection Loss
-        has_watermark = torch.ones_like(detection_logits)
-        losses['detection'] = self.det_loss(detection_logits, has_watermark)
+        has_watermark = torch.ones_like(detection_pred)
+        losses['detection'] = self.det_loss(detection_pred, has_watermark)
 
         # 4. Adversarial Loss (if discriminator outputs provided)
         if disc_fake is not None:
