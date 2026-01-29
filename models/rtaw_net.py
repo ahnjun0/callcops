@@ -388,18 +388,19 @@ class Decoder(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_channels[-1], message_dim),
-            nn.Sigmoid()
+            # nn.Sigmoid() 제거: 수치적 안정성을 위해 로짓(Logit)을 직접 출력하고 
+            # 손실 함수에서 binary_cross_entropy_with_logits를 사용함.
         )
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        워터마크 추출
+        워터마크 추출 (로짓 출력)
 
         Args:
             audio: [B, 1, T] 워터마크된 오디오 (가변 길이)
 
         Returns:
-            message: [B, 128] 추출된 비트 확률 (0~1)
+            logits: [B, 128] 추출된 비트의 로짓 값
         """
         # 1. Feature extraction
         features = self.feature_extractor(audio)  # [B, C, T']
@@ -416,9 +417,9 @@ class Decoder(nn.Module):
         pooled = pooled.squeeze(-1)  # [B, C]
 
         # 5. Classification
-        message = self.classifier(pooled)  # [B, 128]
+        logits = self.classifier(pooled)  # [B, 128]
 
-        return message
+        return logits
 
 
 # =============================================================================
@@ -565,20 +566,22 @@ class CallCopsNet(nn.Module):
         audio: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        워터마크 추출
+        워터마크 추출 (추론용)
 
         Args:
             audio: [B, 1, T] 워터마크된 오디오
 
         Returns:
-            message: [B, 128] 추출된 비트 확률
-            detection: [B, 1] 워터마크 탐지 신뢰도
+            probs: [B, 128] 추출된 비트 확률 (0~1)
+            detection: [B, 1] 워터마크 탐지 신뢰도 (0~1)
         """
-        message = self.decoder(audio)
-        # Detection: max of bit probabilities deviation from 0.5
-        # 워터마크가 있으면 비트들이 0 또는 1에 가깝고, 없으면 0.5에 가까움
-        detection = torch.abs(message - 0.5).mean(dim=1, keepdim=True) * 2
-        return message, detection
+        logits = self.decoder(audio)
+        probs = torch.sigmoid(logits)
+        
+        # Detection: 0.5에서 얼마나 떨어져 있는지로 판단 (0 or 1에 가까우면 신뢰도 높음)
+        # 워터마크가 있으면 신뢰도가 1에 가깝고, 없으면(랜덤하면) 0에 가깝게 정규화
+        detection = torch.abs(probs - 0.5).mean(dim=1, keepdim=True) * 2
+        return probs, detection
 
     def forward(
         self,

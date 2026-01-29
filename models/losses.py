@@ -293,9 +293,10 @@ class BitAccuracyLoss(nn.Module):
     =========================
 
     워터마크 비트 복원 정확도 손실.
+    수치적 안정성을 위해 로짓(Logit) 입력을 받아 BCEWithLogits를 계산합니다.
 
     수식:
-        L_BCE = -Σ [y_i * log(p_i) + (1-y_i) * log(1-p_i)]
+        L_BCE = binary_cross_entropy_with_logits(pred_logits, target_bits)
 
     추가 기능:
     - Focal loss 옵션 (어려운 샘플에 집중)
@@ -316,14 +317,14 @@ class BitAccuracyLoss(nn.Module):
 
     def forward(
         self,
-        pred_bits: torch.Tensor,
+        pred_logits: torch.Tensor,
         target_bits: torch.Tensor
     ) -> torch.Tensor:
         """
         Bit accuracy loss
 
         Args:
-            pred_bits: [B, N_bits] predicted bit probabilities (0-1)
+            pred_logits: [B, N_bits] predicted logits (before sigmoid)
             target_bits: [B, N_bits] target bits (0 or 1)
 
         Returns:
@@ -334,14 +335,16 @@ class BitAccuracyLoss(nn.Module):
             target_bits = target_bits * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
 
         if self.use_focal:
-            # Focal Loss
-            bce = F.binary_cross_entropy(pred_bits, target_bits, reduction='none')
-            pt = torch.where(target_bits == 1, pred_bits, 1 - pred_bits)
+            # Focal Loss with logits
+            # BCP with logits is more stable than sigmoid -> bce
+            bce = F.binary_cross_entropy_with_logits(pred_logits, target_bits, reduction='none')
+            pred_probs = torch.sigmoid(pred_logits)
+            pt = torch.where(target_bits == 1, pred_probs, 1 - pred_probs)
             focal_weight = (1 - pt) ** self.focal_gamma
             loss = (focal_weight * bce).mean()
         else:
-            # Standard BCE
-            loss = F.binary_cross_entropy(pred_bits, target_bits)
+            # Standard BCE with logits (Stable)
+            loss = F.binary_cross_entropy_with_logits(pred_logits, target_bits)
 
         return loss
 
@@ -451,28 +454,30 @@ class DetectionLoss(nn.Module):
 
     워터마크 탐지 신뢰도 손실.
     워터마크된 오디오는 1, 원본은 0으로 분류.
+    수치적 안정성을 위해 로짓 입력을 사용합니다.
     """
 
     def __init__(self):
         super().__init__()
-        self.criterion = nn.BCELoss()
+        # Using logits version for stability
+        self.criterion = nn.BCEWithLogitsLoss()
 
     def forward(
         self,
-        detection_pred: torch.Tensor,
+        detection_logits: torch.Tensor,
         has_watermark: torch.Tensor
     ) -> torch.Tensor:
         """
         Detection loss
 
         Args:
-            detection_pred: [B, 1] detection confidence
+            detection_logits: [B, 1] detection logits
             has_watermark: [B, 1] ground truth (1 if watermarked)
 
         Returns:
             BCE loss
         """
-        return self.criterion(detection_pred, has_watermark)
+        return self.criterion(detection_logits, has_watermark)
 
 
 class CallCopsLoss(nn.Module):
@@ -483,7 +488,7 @@ class CallCopsLoss(nn.Module):
     전체 손실 함수 통합:
         L_total = λ_bit * L_BCE + λ_audio * L_Mel + λ_adv * L_GAN + λ_det * L_Det
 
-    - L_BCE: 비트 정확도 (BER < 5% 목표)
+    - L_BCE: 비트 정확도 (로짓 입력 사용)
     - L_Mel: 음질 보존 (PESQ >= 4.0 목표)
     - L_GAN: 자연스러움
     - L_Det: 탐지 정확도
@@ -519,9 +524,9 @@ class CallCopsLoss(nn.Module):
         self,
         pred_audio: torch.Tensor,
         target_audio: torch.Tensor,
-        pred_bits: torch.Tensor,
+        pred_logits: torch.Tensor,
         target_bits: torch.Tensor,
-        detection_pred: torch.Tensor,
+        detection_logits: torch.Tensor,
         disc_fake: Optional[List[torch.Tensor]] = None,
         disc_real: Optional[List[torch.Tensor]] = None
     ) -> dict:
@@ -531,9 +536,9 @@ class CallCopsLoss(nn.Module):
         Args:
             pred_audio: [B, 1, T] watermarked audio
             target_audio: [B, 1, T] original audio
-            pred_bits: [B, N_bits] extracted bit probabilities
+            pred_logits: [B, N_bits] extracted bit logits
             target_bits: [B, N_bits] original bits
-            detection_pred: [B, 1] detection confidence
+            detection_logits: [B, 1] detection logits
             disc_fake: Discriminator outputs for watermarked (optional)
             disc_real: Discriminator outputs for original (optional)
 
@@ -542,8 +547,8 @@ class CallCopsLoss(nn.Module):
         """
         losses = {}
 
-        # 1. Bit Accuracy Loss (L_BCE)
-        losses['bit'] = self.bit_loss(pred_bits, target_bits)
+        # 1. Bit Accuracy Loss (L_BCE) - Stable Logits Version
+        losses['bit'] = self.bit_loss(pred_logits, target_bits)
 
         # 2. Audio Quality Loss (L_Mel + L_STFT)
         losses['mel'] = self.mel_loss(pred_audio, target_audio)
@@ -554,8 +559,8 @@ class CallCopsLoss(nn.Module):
         losses['stft'] = sc_loss + mag_loss
 
         # 3. Detection Loss
-        has_watermark = torch.ones_like(detection_pred)
-        losses['detection'] = self.det_loss(detection_pred, has_watermark)
+        has_watermark = torch.ones_like(detection_logits)
+        losses['detection'] = self.det_loss(detection_logits, has_watermark)
 
         # 4. Adversarial Loss (if discriminator outputs provided)
         if disc_fake is not None:
@@ -580,21 +585,24 @@ class CallCopsLoss(nn.Module):
 
     def compute_metrics(
         self,
-        pred_bits: torch.Tensor,
+        pred_logits: torch.Tensor,
         target_bits: torch.Tensor
     ) -> dict:
         """
-        Compute evaluation metrics
+        Compute evaluation metrics from logits
 
         Args:
-            pred_bits: [B, N_bits] predicted probabilities
+            pred_logits: [B, N_bits] predicted logits
             target_bits: [B, N_bits] target bits
 
         Returns:
             Dictionary with BER, accuracy
         """
+        # Convert logits to probabilities for metric calculation
+        pred_probs = torch.sigmoid(pred_logits)
+        
         # Round predictions to 0/1
-        pred_binary = (pred_bits > 0.5).float()
+        pred_binary = (pred_probs > 0.5).float()
 
         # Bit Error Rate
         errors = (pred_binary != target_bits).float()
