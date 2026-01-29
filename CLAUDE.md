@@ -12,23 +12,26 @@ CallCops is a real-time audio watermarking system for Korean telephony authentic
 # Install dependencies
 pip install -r requirements.txt
 
-# Training
+# Training (default paths: data/raw/training, data/raw/validation)
 python scripts/train.py \
     --config configs/default.yaml \
-    --data_dir data/train \
-    --val_dir data/val \
+    --epochs 100
+
+# Training with custom paths
+python scripts/train.py \
+    --config configs/default.yaml \
+    --data_dir data/raw/training \
+    --val_dir data/raw/validation \
     --epochs 100
 
 # Resume training from checkpoint
 python scripts/train.py \
-    --config configs/default.yaml \
-    --data_dir data/train \
     --resume checkpoints/checkpoint_epoch50.pt
 
 # Evaluation (PESQ, BER, codec robustness)
 python scripts/evaluate.py \
     --checkpoint checkpoints/best_model.pt \
-    --data_dir data/test \
+    --data_dir data/raw/validation \
     --output results/evaluation.yaml
 
 # Export for Android (TorchScript Lite, ONNX, quantized)

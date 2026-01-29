@@ -423,9 +423,9 @@ def main():
     parser = argparse.ArgumentParser(description="CallCops Training")
     parser.add_argument('--config', type=str, default='configs/default.yaml',
                         help='Path to config file')
-    parser.add_argument('--data_dir', type=str, required=True,
+    parser.add_argument('--data_dir', type=str, default='data/raw/training',
                         help='Path to training data directory')
-    parser.add_argument('--val_dir', type=str, default=None,
+    parser.add_argument('--val_dir', type=str, default='data/raw/validation',
                         help='Path to validation data directory')
     parser.add_argument('--save_dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints')
