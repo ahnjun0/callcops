@@ -654,3 +654,7 @@ if __name__ == "__main__":
     print("\nMetrics:")
     print(f"  BER: {metrics['ber']:.4f} (target < 0.05)")
     print(f"  Accuracy: {metrics['accuracy']:.4f}")
+
+
+# Legacy alias for backward compatibility
+CallShieldLoss = CallCopsLoss

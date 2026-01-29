@@ -5,6 +5,7 @@
 # Core dependencies
 torch>=2.4.0             # Improved MPS support (Mac) & torch.compile
 torchaudio>=2.4.0
+torchcodec>=0.10.0
 numpy>=1.26.0
 
 # Configuration
