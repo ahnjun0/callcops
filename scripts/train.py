@@ -48,7 +48,8 @@ def compute_snr(original: torch.Tensor, watermarked: torch.Tensor) -> float:
     """
     Signal-to-Noise Ratio 계산
 
-    SNR = 10 * log10(Σx² / Σ(x-x')²)
+    SNR = 10 * log10(mean(x²) / mean((x-x')²))
+    Note: sum 대신 mean을 사용하여 긴 오디오/큰 배치에서의 오버플로우 방지
 
     Args:
         original: [B, 1, T] 원본 오디오
@@ -57,8 +58,8 @@ def compute_snr(original: torch.Tensor, watermarked: torch.Tensor) -> float:
     Returns:
         SNR in dB
     """
-    signal_power = torch.sum(original ** 2)
-    noise_power = torch.sum((original - watermarked) ** 2)
+    signal_power = torch.mean(original ** 2)
+    noise_power = torch.mean((original - watermarked) ** 2)
 
     if noise_power < 1e-10:
         return 100.0  # 거의 동일한 경우
@@ -117,7 +118,7 @@ class CallCopsTrainer:
         self.grad_clip = grad_clip
         self.use_amp = use_amp
 
-        # Mixed precision
+        # Mixed precision scaler
         self.scaler = GradScaler() if use_amp else None
 
         # 학습 상태
@@ -127,7 +128,7 @@ class CallCopsTrainer:
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """
-        단일 학습 스텝 (GAN Training)
+        단일 학습 스텝 (GAN Training with AMP)
 
         1. Discriminator Update: Maximize log(D(real)) + log(1 - D(fake))
         2. Generator Update: Minimize total loss (bit + audio + adv)
@@ -135,79 +136,110 @@ class CallCopsTrainer:
         audio = batch['audio'].to(self.device)
         bits = batch['bits'].to(self.device)
 
+        # AMP Context Manager
+        # use_amp가 False면 autocast는 아무 효과 없음 (no-op)
+        
         # ========================================
         # 1. Discriminator Update
         # ========================================
         self.opt_d.zero_grad()
 
-        with torch.no_grad():
-            # Generator forward (no grad for D update)
-            watermarked = self.model.encoder(audio, bits)
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.no_grad():
+                # Generator forward (no grad for D update)
+                watermarked, _ = self.model.embed(audio, bits)
 
-        # Discriminator forward
-        disc_real = self.model.discriminator(audio)
-        disc_fake = self.model.discriminator(watermarked.detach())
+            # Discriminator forward
+            disc_real = self.model.discriminator(audio)
+            disc_fake = self.model.discriminator(watermarked.detach())
 
-        # Discriminator loss
-        d_loss = self.loss_fn.adv_loss.discriminator_loss(disc_real, disc_fake)
+            # Discriminator loss
+            d_loss = self.loss_fn.adv_loss.discriminator_loss(disc_real, disc_fake)
 
-        d_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.model.discriminator.parameters(),
-            self.grad_clip
-        )
-        self.opt_d.step()
+        # Backward & Step
+        if self.use_amp:
+            self.scaler.scale(d_loss).backward()
+            self.scaler.unscale_(self.opt_d)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.discriminator.parameters(),
+                self.grad_clip
+            )
+            self.scaler.step(self.opt_d)
+        else:
+            d_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.discriminator.parameters(),
+                self.grad_clip
+            )
+            self.opt_d.step()
 
         # ========================================
         # 2. Generator Update
         # ========================================
         self.opt_g.zero_grad()
 
-        # Generator forward
-        watermarked = self.model.encoder(audio, bits)
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # Generator forward
+            watermarked, _ = self.model.embed(audio, bits)
 
-        # Codec simulation (optional, for robustness)
-        if self.codec_sim is not None:
-            watermarked_degraded, codec_used = self.codec_sim(watermarked)
+            # Codec simulation (optional, for robustness)
+            if self.codec_sim is not None:
+                watermarked_degraded, codec_used = self.codec_sim(watermarked)
+            else:
+                watermarked_degraded = watermarked
+                codec_used = 'none'
+
+            # Decoder forward (returns logits)
+            pred_logits = self.model.decoder(watermarked_degraded)
+
+            # Detection logits: 비트 로짓의 절대값 평균
+            # 워터마크가 있으면 로짓이 0에서 멀어짐 -> 절대값 큼 -> Detection score 높음
+            detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
+
+            # Discriminator forward (for generator loss)
+            disc_fake = self.model.discriminator(watermarked)
+
+            # Generator losses
+            losses = self.loss_fn(
+                pred_audio=watermarked,
+                target_audio=audio,
+                pred_bits=pred_logits,  # logits
+                target_bits=bits,
+                detection_pred=detection_logits,  # logits
+                disc_fake=disc_fake
+            )
+            
+            g_loss = losses['total']
+
+        # Backward & Step
+        if self.use_amp:
+            self.scaler.scale(g_loss).backward()
+            self.scaler.unscale_(self.opt_g)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.encoder.parameters()) +
+                list(self.model.decoder.parameters()),
+                self.grad_clip
+            )
+            self.scaler.step(self.opt_g)
+            
+            # Update scaler once per iteration
+            self.scaler.update()
         else:
-            watermarked_degraded = watermarked
-            codec_used = 'none'
-
-        # Decoder forward (returns logits)
-        pred_logits = self.model.decoder(watermarked_degraded)
-
-        # Detection logits: 비트 로짓의 절대값 평균 (워터마크 있으면 높음)
-        detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
-
-        # Discriminator forward (for generator loss)
-        disc_fake = self.model.discriminator(watermarked)
-
-        # Generator losses
-        losses = self.loss_fn(
-            pred_audio=watermarked,
-            target_audio=audio,
-            pred_bits=pred_logits,  # logits!
-            target_bits=bits,
-            detection_pred=detection_logits,  # logits!
-            disc_fake=disc_fake
-        )
-
-        # Backward
-        losses['total'].backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            list(self.model.encoder.parameters()) +
-            list(self.model.decoder.parameters()),
-            self.grad_clip
-        )
-        self.opt_g.step()
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.encoder.parameters()) +
+                list(self.model.decoder.parameters()),
+                self.grad_clip
+            )
+            self.opt_g.step()
 
         # ========================================
         # 3. Metrics
         # ========================================
         with torch.no_grad():
-            ber = compute_ber(pred_logits, bits)
-            snr = compute_snr(audio, watermarked)
+            # CPU로 이동하여 계산 (메모리 누수 방지)
+            ber = compute_ber(pred_logits.detach().float(), bits.detach().float())
+            snr = compute_snr(audio.detach().float(), watermarked.detach().float())
 
         self.global_step += 1
 
@@ -241,7 +273,7 @@ class CallCopsTrainer:
             bits = batch['bits'].to(self.device)
 
             # Forward
-            watermarked = self.model.encoder(audio, bits)
+            watermarked, _ = self.model.embed(audio, bits)
             pred_logits = self.model.decoder(watermarked)
             detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
 
