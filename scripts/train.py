@@ -707,8 +707,25 @@ def main():
         '--seed', type=int, default=42,
         help='Random seed'
     )
+    
+    # 디버깅 및 안정성
+    parser.add_argument(
+        '--no_amp', action='store_true',
+        help='Disable Mixed Precision (AMP) training (Recommended if loss=nan occurs)'
+    )
+    parser.add_argument(
+        '--debug', action='store_true',
+        help='Enable Anomaly Detection for debugging NaNs'
+    )
 
     args = parser.parse_args()
+
+    # ========================================
+    # 디버그 모드 설정
+    # ========================================
+    if args.debug:
+        print("\n⚠️ DEBUG MODE ENABLED: Anomaly Detection is ON (This will slow down training)")
+        torch.autograd.set_detect_anomaly(True)
 
     # ========================================
     # Config 로드 또는 생성
@@ -742,7 +759,7 @@ def main():
                 'lambda_adv': 0.1,
                 'lambda_det': 0.5,
                 'lambda_stft': 2.0,
-                'use_amp': True  # AMP Default
+                'use_amp': not args.no_amp  # CLI 인자로 제어
             },
             'codec': {
                 'enabled': False,
@@ -754,6 +771,7 @@ def main():
     config['training']['epochs'] = args.epochs
     config['training']['batch_size'] = args.batch_size
     config['training']['learning_rate'] = args.lr
+    config['training']['use_amp'] = not args.no_amp
 
     # ========================================
     # 디바이스 설정
@@ -768,6 +786,7 @@ def main():
     if device.type == 'cuda':
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"  Mixed Precision: {'Enabled' if config['training']['use_amp'] else 'Disabled'}")
 
     # ========================================
     # 자동 Resume 확인
