@@ -654,6 +654,7 @@ def create_dataloader(
     min_duration: float = 3.0,
     augmentation_config: Optional[Dict[str, Any]] = None,
     for_watermarking: bool = True,
+    pin_memory: bool = True,
     **kwargs
 ) -> DataLoader:
     """
@@ -668,6 +669,8 @@ def create_dataloader(
         min_duration: 최소 오디오 길이 (초)
         augmentation_config: 증강 설정
         for_watermarking: 워터마킹 데이터셋 사용 여부
+        pin_memory: GPU 전송 가속 여부
+        **kwargs: CallCopsDataset에 전달할 추가 인자
 
     Returns:
         PyTorch DataLoader
@@ -678,7 +681,7 @@ def create_dataloader(
         aug_config = augmentation_config or {}
         augmentation = AudioAugmentation(sample_rate=sample_rate, **aug_config)
 
-    # 기본 데이터셋 생성
+    # 기본 데이터셋 생성 (pin_memory는 Dataset 인자가 아님)
     base_dataset = CallCopsDataset(
         data_dir=data_dir,
         sample_rate=sample_rate,
@@ -704,7 +707,7 @@ def create_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         collate_fn=collate,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=(mode == "train")
     )
 
