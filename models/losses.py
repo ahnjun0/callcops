@@ -37,11 +37,13 @@ class MultiResolutionSTFTLoss(nn.Module):
         fft_sizes: List[int] = [64, 128, 256],
         hop_sizes: Optional[List[int]] = None,
         win_sizes: Optional[List[int]] = None,
-        window: str = "hann"
+        window: str = "hann",
+        eps: float = 1e-7
     ):
         super().__init__()
 
         self.fft_sizes = fft_sizes
+        self.eps = eps
 
         if hop_sizes is None:
             hop_sizes = [n // 4 for n in fft_sizes]
@@ -130,12 +132,14 @@ class MultiResolutionSTFTLoss(nn.Module):
 
             # Spectral Convergence Loss
             # ||S_target - S_pred||_F / ||S_target||_F
-            sc_loss += torch.norm(target_mag - pred_mag, p='fro') / (torch.norm(target_mag, p='fro') + 1e-8)
+            # eps를 더해 0으로 나누기 방지
+            sc_loss += torch.norm(target_mag - pred_mag, p='fro') / (torch.norm(target_mag, p='fro') + self.eps)
 
             # Log Magnitude Loss
             # ||log(S_target) - log(S_pred)||_1
-            log_pred = torch.log(pred_mag + 1e-8)
-            log_target = torch.log(target_mag + 1e-8)
+            # log(0) 방지를 위해 eps 추가
+            log_pred = torch.log(pred_mag + self.eps)
+            log_target = torch.log(target_mag + self.eps)
             mag_loss += F.l1_loss(log_pred, log_target)
 
         # Average over resolutions
@@ -166,7 +170,8 @@ class MultiResolutionMelLoss(nn.Module):
         n_fft_list: List[int] = [64, 128, 256],
         n_mels: int = 40,
         fmin: float = 80.0,
-        fmax: Optional[float] = None
+        fmax: Optional[float] = None,
+        eps: float = 1e-7
     ):
         super().__init__()
 
@@ -175,6 +180,7 @@ class MultiResolutionMelLoss(nn.Module):
         self.n_mels = n_mels
         self.fmin = fmin
         self.fmax = fmax or (sample_rate / 2 - 100)  # 3900Hz for 8kHz
+        self.eps = eps
 
         # Mel filterbanks for each resolution
         self.mel_bases = nn.ParameterList()
@@ -277,9 +283,9 @@ class MultiResolutionMelLoss(nn.Module):
             pred_mel = torch.matmul(mel_basis, pred_mag)
             target_mel = torch.matmul(mel_basis, target_mag)
 
-            # Log mel
-            pred_log_mel = torch.log(pred_mel + 1e-8)
-            target_log_mel = torch.log(target_mel + 1e-8)
+            # Log mel (eps 추가)
+            pred_log_mel = torch.log(pred_mel + self.eps)
+            target_log_mel = torch.log(target_mel + self.eps)
 
             # L1 loss
             total_loss += F.l1_loss(pred_log_mel, target_log_mel)
@@ -520,6 +526,7 @@ class CallCopsLoss(nn.Module):
         self.adv_loss = AdversarialLoss(mode=gan_mode)
         self.det_loss = DetectionLoss()
 
+    @torch.cuda.amp.autocast(enabled=False)
     def forward(
         self,
         pred_audio: torch.Tensor,
@@ -533,18 +540,21 @@ class CallCopsLoss(nn.Module):
         """
         Complete loss computation
 
-        Args:
-            pred_audio: [B, 1, T] watermarked audio
-            target_audio: [B, 1, T] original audio
-            pred_bits: [B, N_bits] extracted bit logits
-            target_bits: [B, N_bits] original bits
-            detection_pred: [B, 1] detection logits
-            disc_fake: Discriminator outputs for watermarked (optional)
-            disc_real: Discriminator outputs for original (optional)
-
-        Returns:
-            Dictionary containing all loss components and total
+        Note:
+            로그 연산 및 정밀도 안정을 위해 FP32로 강제 실행됩니다.
         """
+        # 정밀도 보장을 위해 입력을 FP32로 캐스팅
+        pred_audio = pred_audio.float()
+        target_audio = target_audio.float()
+        pred_bits = pred_bits.float()
+        target_bits = target_bits.float()
+        detection_pred = detection_pred.float()
+        
+        if disc_fake is not None:
+            disc_fake = [d.float() for d in disc_fake]
+        if disc_real is not None:
+            disc_real = [d.float() for d in disc_real]
+
         losses = {}
 
         # 1. Bit Accuracy Loss (L_BCE) - Stable Logits Version

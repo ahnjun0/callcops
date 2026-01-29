@@ -153,7 +153,7 @@ class CallCopsTrainer:
         # ========================================
         self.opt_d.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=torch.bfloat16):
             with torch.no_grad():
                 # Generator forward (no grad for D update)
                 watermarked, _ = self.model.embed(audio, bits)
@@ -188,7 +188,7 @@ class CallCopsTrainer:
         # ========================================
         self.opt_g.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=torch.bfloat16):
             # Generator forward
             watermarked, _ = self.model.embed(audio, bits)
 
