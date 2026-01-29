@@ -249,7 +249,7 @@ class CallCopsDataset(Dataset):
         - speaker_type: 화자 타입 ("상담사" 또는 "고객")
     """
 
-    # 화자 타입 매핑
+    # 화자 타입 매핑 (내부 정규화용)
     SPEAKER_TYPE_MAP = {
         "상담사": "counselor",
         "고객": "customer",
@@ -286,32 +286,15 @@ class CallCopsDataset(Dataset):
     def _load_dataset(self):
         """
         세션 폴더를 순회하며 JSON 메타데이터를 파싱하고 데이터 항목 리스트 생성.
-
-        JSON 구조:
-        {
-            "dataSet": {
-                "typeInfo": {
-                    "speakers": [
-                        {"id": "SPK01", "type": "상담사", "gender": "M", ...},
-                        {"id": "SPK02", "type": "고객", "gender": "F", ...}
-                    ]
-                },
-                "dialogs": [
-                    {
-                        "audioPath": "0001.wav",
-                        "duration": 3.5,
-                        "text": "안녕하세요 상담사입니다",
-                        "speaker_id": "SPK01"
-                    },
-                    ...
-                ]
-            }
-        }
         """
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
 
         session_dirs = [d for d in self.data_dir.iterdir() if d.is_dir()]
+
+        if not session_dirs:
+            print(f"[Warning] No session directories found in {self.data_dir}")
+            return
 
         for session_dir in session_dirs:
             # JSON 메타데이터 파일 찾기
@@ -349,38 +332,46 @@ class CallCopsDataset(Dataset):
         """
         화자 ID → 화자 타입 매핑 생성
 
-        JSON 구조를 유연하게 처리:
-        - dataSet.typeInfo.speakers
-        - 또는 speakers (최상위)
+        JSON 구조:
+        dataSet.typeInfo.speakers 리스트 참조.
+        "type" 값이 "상담사1", "고객1" 등으로 되어 있어 부분 문자열 매칭 필요.
         """
         speaker_map = {}
+        speakers = []
 
-        # 다양한 JSON 구조 처리
-        speakers = None
-
+        # JSON 구조 접근: dataSet -> typeInfo -> speakers
         if "dataSet" in metadata:
             dataset = metadata["dataSet"]
             if "typeInfo" in dataset and "speakers" in dataset["typeInfo"]:
                 speakers = dataset["typeInfo"]["speakers"]
+            # Fallback for flexibility
             elif "speakers" in dataset:
                 speakers = dataset["speakers"]
         elif "speakers" in metadata:
             speakers = metadata["speakers"]
 
-        if speakers:
-            for speaker in speakers:
-                speaker_id = speaker.get("id") or speaker.get("speaker_id")
-                speaker_type = speaker.get("type") or speaker.get("speaker_type", "unknown")
+        for speaker in speakers:
+            speaker_id = speaker.get("id") or speaker.get("speaker_id")
+            speaker_type = speaker.get("type") or speaker.get("speaker_type", "unknown")
 
-                if speaker_id:
-                    # 정규화된 타입으로 매핑
-                    normalized_type = self.SPEAKER_TYPE_MAP.get(speaker_type, speaker_type)
-                    speaker_map[speaker_id] = normalized_type
+            if speaker_id:
+                # 부분 문자열 매칭으로 타입 정규화
+                if "상담사" in speaker_type:
+                    normalized_type = "counselor"
+                elif "고객" in speaker_type:
+                    normalized_type = "customer"
+                else:
+                    normalized_type = self.SPEAKER_TYPE_MAP.get(speaker_type, "unknown")
+                
+                speaker_map[speaker_id] = normalized_type
 
         return speaker_map
 
     def _get_dialogs(self, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """dialogs 리스트 추출"""
+        """
+        dialogs 리스트 추출
+        JSON 구조: dataSet -> dialogs
+        """
         if "dataSet" in metadata:
             dataset = metadata["dataSet"]
             if "dialogs" in dataset:
@@ -389,9 +380,7 @@ class CallCopsDataset(Dataset):
                 return dataset["utterances"]
         elif "dialogs" in metadata:
             return metadata["dialogs"]
-        elif "utterances" in metadata:
-            return metadata["utterances"]
-
+        
         return []
 
     def _process_dialog(
@@ -403,45 +392,50 @@ class CallCopsDataset(Dataset):
         """
         개별 dialog 항목 처리
 
-        필터링:
-        1. duration < min_duration → 제외
-        2. WAV 파일 미존재 → 제외
+        이슈 해결:
+        1. 경로 불일치: JSON의 'audioPath'는 디렉토리 포함(D03/...). 
+           실제 파일은 session_dir 바로 아래에 있음. -> 파일명만 추출.
+        2. 화자 키 불일치: 'speaker_id' 대신 'speaker' 키 사용.
+        3. 안정성: duration float 변환.
         """
-        # 오디오 경로
-        audio_path = dialog.get("audioPath") or dialog.get("audio_path")
-        if not audio_path:
+        # 1. 오디오 경로 처리
+        raw_audio_path = dialog.get("audioPath") or dialog.get("audio_path")
+        if not raw_audio_path:
             return None
-
-        # 전체 경로 구성
-        full_audio_path = session_dir / audio_path
+        
+        # 파일명만 추출 (예: "D03/.../0001.wav" -> "0001.wav")
+        filename = Path(raw_audio_path).name
+        full_audio_path = session_dir / filename
 
         # 파일 존재 확인
         if not full_audio_path.exists():
-            return None
+            # 디버깅용: 원래 경로로도 한번 체크 (혹시 구조가 맞을 수도 있으니)
+            if (session_dir / raw_audio_path).exists():
+                full_audio_path = session_dir / raw_audio_path
+            else:
+                return None
 
-        # duration 확인
+        # 2. duration 안전하게 가져오기
         duration = dialog.get("duration", 0)
-
-        # duration이 문자열인 경우 처리
         if isinstance(duration, str):
             try:
                 duration = float(duration)
             except ValueError:
                 duration = 0
 
-        # 최소 길이 필터링 (3초 미만 제외)
+        # 최소 길이 필터링
         if duration < self.min_duration:
             return None
 
-        # 최대 길이 필터링 (선택적)
+        # 최대 길이 필터링
         if self.max_duration and duration > self.max_duration:
             return None
 
         # 텍스트
         text = dialog.get("text") or dialog.get("transcription", "")
 
-        # 화자 ID → 타입
-        speaker_id = dialog.get("speaker_id") or dialog.get("speakerId")
+        # 3. 화자 ID 가져오기 (speaker 키 우선)
+        speaker_id = dialog.get("speaker") or dialog.get("speaker_id") or dialog.get("speakerId")
         speaker_type = speaker_map.get(speaker_id, "unknown")
 
         return {
@@ -468,7 +462,7 @@ class CallCopsDataset(Dataset):
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # 리샘플링 (8kHz로 통일)
+        # 리샘플링
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(
                 orig_freq=sr,
@@ -476,7 +470,7 @@ class CallCopsDataset(Dataset):
             )
             waveform = resampler(waveform)
 
-        # 정규화 [-1, 1]
+        # 정규화
         max_val = waveform.abs().max()
         if max_val > 0:
             waveform = waveform / max_val
