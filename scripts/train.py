@@ -2,17 +2,20 @@
 CallCops: Training Script
 ==============================
 
-RTAW 모델 학습 스크립트.
+Real-Time Audio Watermarking 모델 학습 스크립트.
 
 학습 전략:
-1. Generator (Encoder + Decoder) 학습
-2. Discriminator 학습
-3. Codec Augmentation을 통한 robustness 강화
-4. Curriculum Learning: 점진적 난이도 증가
+1. Generator (Encoder + Decoder) 학습: Bit Loss + Audio Loss + Adversarial Loss
+2. Discriminator 학습: Real vs Fake 판별
+3. Codec Augmentation (Optional): G.711/G.729 robustness 강화
 
 품질 목표:
 - PESQ >= 4.0
-- BER < 5% (G.729 압축 후)
+- BER < 5%
+
+Usage:
+    python scripts/train.py --epochs 100 --batch_size 32
+    python scripts/train.py --config configs/default.yaml --resume checkpoints/best_model.pth
 """
 
 import os
@@ -20,196 +23,215 @@ import sys
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast
 import yaml
 from tqdm import tqdm
 
 # 프로젝트 경로 추가
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import RTAWNet, CallCopsLoss, DifferentiableCodecSimulator
-from scripts.dataset import create_dataloader
+from models import CallCopsNet, CallCopsLoss, DifferentiableCodecSimulator
+from scripts.dataset import create_train_val_loaders, create_dataloader
 
 
-class Trainer:
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def compute_snr(original: torch.Tensor, watermarked: torch.Tensor) -> float:
+    """
+    Signal-to-Noise Ratio 계산
+
+    SNR = 10 * log10(Σx² / Σ(x-x')²)
+
+    Args:
+        original: [B, 1, T] 원본 오디오
+        watermarked: [B, 1, T] 워터마크된 오디오
+
+    Returns:
+        SNR in dB
+    """
+    signal_power = torch.sum(original ** 2)
+    noise_power = torch.sum((original - watermarked) ** 2)
+
+    if noise_power < 1e-10:
+        return 100.0  # 거의 동일한 경우
+
+    snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
+    return snr.item()
+
+
+def compute_ber(pred_logits: torch.Tensor, target_bits: torch.Tensor) -> float:
+    """
+    Bit Error Rate 계산
+
+    Args:
+        pred_logits: [B, 128] 예측된 로짓
+        target_bits: [B, 128] 목표 비트
+
+    Returns:
+        BER (0~1)
+    """
+    pred_bits = (torch.sigmoid(pred_logits) > 0.5).float()
+    errors = (pred_bits != target_bits).float()
+    return errors.mean().item()
+
+
+# =============================================================================
+# Trainer Class
+# =============================================================================
+
+class CallCopsTrainer:
     """
     CallCops 모델 트레이너
-    ===========================
+    ======================
 
-    학습 루프 및 검증 관리.
+    GAN 기반 학습 루프:
+    1. Discriminator Update: Real vs Fake 판별
+    2. Generator Update: Bit Loss + Audio Loss + Adversarial Loss
     """
 
     def __init__(
         self,
-        config: Dict[str, Any],
-        device: torch.device
+        model: CallCopsNet,
+        loss_fn: CallCopsLoss,
+        opt_g: optim.Optimizer,
+        opt_d: optim.Optimizer,
+        device: torch.device,
+        codec_sim: Optional[DifferentiableCodecSimulator] = None,
+        grad_clip: float = 1.0,
+        use_amp: bool = False
     ):
-        self.config = config
+        self.model = model
+        self.loss_fn = loss_fn
+        self.opt_g = opt_g
+        self.opt_d = opt_d
         self.device = device
+        self.codec_sim = codec_sim
+        self.grad_clip = grad_clip
+        self.use_amp = use_amp
 
-        # 모델 초기화
-        self.model = RTAWNet(
-            bits_dim=config['watermark']['payload_length'],
-            encoder_config=config.get('model', {}).get('encoder', {}),
-            decoder_config=config.get('model', {}).get('decoder', {}),
-            discriminator_config=config.get('model', {}).get('discriminator', {})
-        ).to(device)
-
-        # 코덱 시뮬레이터
-        self.codec_sim = DifferentiableCodecSimulator(
-            codec_types=config.get('codec', {}).get('types', ['g711_alaw', 'g729', 'none']),
-            curriculum_epochs=config.get('training', {}).get('curriculum_epochs', 10)
-        ).to(device)
-
-        # 손실 함수
-        training_config = config.get('training', {})
-        self.criterion = CallCopsLoss(
-            lambda_bit=training_config.get('lambda_bit', 1.0),
-            lambda_audio=training_config.get('lambda_audio', 10.0),
-            lambda_adv=training_config.get('lambda_adv', 0.1),
-            sample_rate=config.get('audio', {}).get('sample_rate', 8000)
-        ).to(device)
-
-        # Optimizer
-        lr = training_config.get('learning_rate', 0.0001)
-        betas = training_config.get('adam_betas', [0.5, 0.9])
-
-        # Generator optimizer (Encoder + Decoder)
-        self.optim_g = optim.Adam(
-            list(self.model.encoder.parameters()) +
-            list(self.model.decoder.parameters()),
-            lr=lr,
-            betas=tuple(betas)
-        )
-
-        # Discriminator optimizer
-        self.optim_d = optim.Adam(
-            self.model.discriminator.parameters(),
-            lr=lr,
-            betas=tuple(betas)
-        )
-
-        # Scheduler
-        self.scheduler_g = optim.lr_scheduler.CosineAnnealingLR(
-            self.optim_g,
-            T_max=training_config.get('epochs', 100)
-        )
-        self.scheduler_d = optim.lr_scheduler.CosineAnnealingLR(
-            self.optim_d,
-            T_max=training_config.get('epochs', 100)
-        )
-
-        # Gradient clipping
-        self.grad_clip = training_config.get('grad_clip', 1.0)
+        # Mixed precision
+        self.scaler = GradScaler() if use_amp else None
 
         # 학습 상태
         self.current_epoch = 0
         self.global_step = 0
         self.best_ber = 1.0
 
-    def train_step(
-        self,
-        batch: Dict[str, torch.Tensor]
-    ) -> Dict[str, float]:
-        """단일 학습 스텝"""
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """
+        단일 학습 스텝 (GAN Training)
+
+        1. Discriminator Update: Maximize log(D(real)) + log(1 - D(fake))
+        2. Generator Update: Minimize total loss (bit + audio + adv)
+        """
         audio = batch['audio'].to(self.device)
         bits = batch['bits'].to(self.device)
 
-        # ==================
-        # Generator 학습
-        # ==================
-        self.optim_g.zero_grad()
+        # ========================================
+        # 1. Discriminator Update
+        # ========================================
+        self.opt_d.zero_grad()
 
-        # Forward pass
-        watermarked, attention = self.model.embed(audio, bits)
-
-        # 코덱 시뮬레이션 (robustness 강화)
-        watermarked_codec, codec_used = self.codec_sim(watermarked)
-
-        # 비트 추출
-        bit_probs, detection = self.model.extract(watermarked_codec)
-
-        # Discriminator forward (for GAN loss)
         with torch.no_grad():
-            disc_real = self.model.discriminator(audio)
+            # Generator forward (no grad for D update)
+            watermarked = self.model.encoder(audio, bits)
+
+        # Discriminator forward
+        disc_real = self.model.discriminator(audio)
+        disc_fake = self.model.discriminator(watermarked.detach())
+
+        # Discriminator loss
+        d_loss = self.loss_fn.adv_loss.discriminator_loss(disc_real, disc_fake)
+
+        d_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.model.discriminator.parameters(),
+            self.grad_clip
+        )
+        self.opt_d.step()
+
+        # ========================================
+        # 2. Generator Update
+        # ========================================
+        self.opt_g.zero_grad()
+
+        # Generator forward
+        watermarked = self.model.encoder(audio, bits)
+
+        # Codec simulation (optional, for robustness)
+        if self.codec_sim is not None:
+            watermarked_degraded, codec_used = self.codec_sim(watermarked)
+        else:
+            watermarked_degraded = watermarked
+            codec_used = 'none'
+
+        # Decoder forward (returns logits)
+        pred_logits = self.model.decoder(watermarked_degraded)
+
+        # Detection logits: 비트 로짓의 절대값 평균 (워터마크 있으면 높음)
+        detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
+
+        # Discriminator forward (for generator loss)
         disc_fake = self.model.discriminator(watermarked)
 
-        # 손실 계산
-        losses = self.criterion(
+        # Generator losses
+        losses = self.loss_fn(
             pred_audio=watermarked,
             target_audio=audio,
-            pred_bits=bit_probs,
+            pred_bits=pred_logits,  # logits!
             target_bits=bits,
-            detection_pred=detection,
-            disc_fake=disc_fake,
-            disc_real=disc_real
+            detection_pred=detection_logits,  # logits!
+            disc_fake=disc_fake
         )
 
-        # Generator backward
+        # Backward
         losses['total'].backward()
 
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
             list(self.model.encoder.parameters()) +
             list(self.model.decoder.parameters()),
             self.grad_clip
         )
+        self.opt_g.step()
 
-        self.optim_g.step()
+        # ========================================
+        # 3. Metrics
+        # ========================================
+        with torch.no_grad():
+            ber = compute_ber(pred_logits, bits)
+            snr = compute_snr(audio, watermarked)
 
-        # ==================
-        # Discriminator 학습
-        # ==================
-        self.optim_d.zero_grad()
-
-        # Discriminator forward (detached watermarked)
-        disc_real = self.model.discriminator(audio)
-        disc_fake = self.model.discriminator(watermarked.detach())
-
-        # Discriminator loss
-        d_loss = self.criterion.adv_loss.discriminator_loss(disc_real, disc_fake)
-        d_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            self.model.discriminator.parameters(),
-            self.grad_clip
-        )
-
-        self.optim_d.step()
-
-        # 메트릭
-        metrics = self.criterion.compute_metrics(bit_probs, bits)
+        self.global_step += 1
 
         return {
             'loss_total': losses['total'].item(),
             'loss_bit': losses['bit'].item(),
             'loss_mel': losses['mel'].item(),
+            'loss_stft': losses['stft'].item(),
             'loss_adv_g': losses['adv_g'].item(),
             'loss_adv_d': d_loss.item(),
-            'ber': metrics['ber'],
-            'accuracy': metrics['accuracy'],
+            'ber': ber,
+            'snr': snr,
             'codec': codec_used
         }
 
     @torch.no_grad()
-    def validate(
-        self,
-        val_loader: DataLoader
-    ) -> Dict[str, float]:
+    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """검증 루프"""
         self.model.eval()
 
         total_metrics = {
             'loss': 0.0,
             'ber': 0.0,
-            'ber_g711': 0.0,
-            'ber_g729': 0.0,
+            'snr': 0.0,
             'accuracy': 0.0
         }
         num_batches = 0
@@ -218,283 +240,467 @@ class Trainer:
             audio = batch['audio'].to(self.device)
             bits = batch['bits'].to(self.device)
 
-            # Forward pass
-            watermarked, _ = self.model.embed(audio, bits)
+            # Forward
+            watermarked = self.model.encoder(audio, bits)
+            pred_logits = self.model.decoder(watermarked)
+            detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
 
-            # 코덱 없이 추출
-            bit_probs, detection = self.model.extract(watermarked)
-            metrics = self.criterion.compute_metrics(bit_probs, bits)
-            total_metrics['ber'] += metrics['ber']
-            total_metrics['accuracy'] += metrics['accuracy']
-
-            # G.711 A-law 후 추출
-            watermarked_g711, _ = self.codec_sim(watermarked, codec_type='g711_alaw')
-            bit_probs_g711, _ = self.model.extract(watermarked_g711)
-            metrics_g711 = self.criterion.compute_metrics(bit_probs_g711, bits)
-            total_metrics['ber_g711'] += metrics_g711['ber']
-
-            # G.729 후 추출
-            watermarked_g729, _ = self.codec_sim(watermarked, codec_type='g729')
-            bit_probs_g729, _ = self.model.extract(watermarked_g729)
-            metrics_g729 = self.criterion.compute_metrics(bit_probs_g729, bits)
-            total_metrics['ber_g729'] += metrics_g729['ber']
-
-            # 손실
-            losses = self.criterion(
+            # Losses
+            losses = self.loss_fn(
                 pred_audio=watermarked,
                 target_audio=audio,
-                pred_bits=bit_probs,
+                pred_bits=pred_logits,
                 target_bits=bits,
-                detection_pred=detection
+                detection_pred=detection_logits
             )
+
+            # Metrics
+            ber = compute_ber(pred_logits, bits)
+            snr = compute_snr(audio, watermarked)
+
             total_metrics['loss'] += losses['total'].item()
+            total_metrics['ber'] += ber
+            total_metrics['snr'] += snr
+            total_metrics['accuracy'] += (1.0 - ber)
 
             num_batches += 1
 
-        # 평균
+        # Average
         for key in total_metrics:
-            total_metrics[key] /= num_batches
+            total_metrics[key] /= max(num_batches, 1)
 
         self.model.train()
-
         return total_metrics
 
-    def train(
+    def train_epoch(
         self,
         train_loader: DataLoader,
-        val_loader: DataLoader,
-        num_epochs: int,
-        save_dir: Path,
-        log_dir: Optional[Path] = None
-    ):
-        """
-        전체 학습 루프
+        epoch: int,
+        total_epochs: int
+    ) -> Dict[str, float]:
+        """에포크 학습"""
+        self.model.train()
+        self.current_epoch = epoch
 
-        Args:
-            train_loader: 학습 DataLoader
-            val_loader: 검증 DataLoader
-            num_epochs: 에포크 수
-            save_dir: 체크포인트 저장 디렉토리
-            log_dir: TensorBoard 로그 디렉토리
-        """
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        writer = None
-        if log_dir:
-            log_dir = Path(log_dir)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            writer = SummaryWriter(log_dir)
-
-        print("=" * 60)
-        print("CallCops Training Started")
-        print("=" * 60)
-        print(f"Device: {self.device}")
-        print(f"Epochs: {num_epochs}")
-        print(f"Training samples: {len(train_loader.dataset)}")
-        print(f"Validation samples: {len(val_loader.dataset)}")
-        print("=" * 60)
-
-        for epoch in range(self.current_epoch, num_epochs):
-            self.current_epoch = epoch
-
-            # Curriculum learning: 코덱 난이도 조절
+        # Codec curriculum (optional)
+        if self.codec_sim is not None:
             self.codec_sim.set_epoch(epoch)
 
-            # 학습 루프
-            self.model.train()
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        epoch_metrics = {
+            'loss_total': 0.0,
+            'loss_bit': 0.0,
+            'ber': 0.0,
+            'snr': 0.0
+        }
 
-            epoch_metrics = {
-                'loss_total': 0.0,
-                'loss_bit': 0.0,
-                'ber': 0.0
-            }
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}/{total_epochs}",
+            leave=True
+        )
 
-            for batch_idx, batch in enumerate(pbar):
-                metrics = self.train_step(batch)
+        for batch_idx, batch in enumerate(pbar):
+            metrics = self.train_step(batch)
 
-                # 누적
-                for key in epoch_metrics:
-                    if key in metrics:
-                        epoch_metrics[key] += metrics[key]
-
-                self.global_step += 1
-
-                # Progress bar 업데이트
-                pbar.set_postfix({
-                    'loss': f"{metrics['loss_total']:.4f}",
-                    'ber': f"{metrics['ber']:.4f}",
-                    'codec': metrics['codec']
-                })
-
-                # TensorBoard 로깅
-                if writer and self.global_step % 100 == 0:
-                    for key, value in metrics.items():
-                        if isinstance(value, (int, float)):
-                            writer.add_scalar(f'train/{key}', value, self.global_step)
-
-            # 에포크 평균
-            num_batches = len(train_loader)
+            # 누적
             for key in epoch_metrics:
-                epoch_metrics[key] /= num_batches
+                if key in metrics:
+                    epoch_metrics[key] += metrics[key]
 
-            # 검증
-            val_metrics = self.validate(val_loader)
+            # Progress bar
+            pbar.set_postfix({
+                'loss': f"{metrics['loss_total']:.4f}",
+                'ber': f"{metrics['ber']:.4f}",
+                'snr': f"{metrics['snr']:.1f}dB"
+            })
 
-            print(f"\nEpoch {epoch+1} Summary:")
-            print(f"  Train Loss: {epoch_metrics['loss_total']:.4f}")
-            print(f"  Train BER: {epoch_metrics['ber']:.4f}")
-            print(f"  Val BER (no codec): {val_metrics['ber']:.4f}")
-            print(f"  Val BER (G.711): {val_metrics['ber_g711']:.4f}")
-            print(f"  Val BER (G.729): {val_metrics['ber_g729']:.4f}")
+        # Average
+        num_batches = len(train_loader)
+        for key in epoch_metrics:
+            epoch_metrics[key] /= max(num_batches, 1)
 
-            # TensorBoard 검증 로깅
-            if writer:
-                for key, value in val_metrics.items():
-                    writer.add_scalar(f'val/{key}', value, epoch)
-
-            # Scheduler step
-            self.scheduler_g.step()
-            self.scheduler_d.step()
-
-            # 체크포인트 저장
-            is_best = val_metrics['ber_g729'] < self.best_ber
-            if is_best:
-                self.best_ber = val_metrics['ber_g729']
-
-            self.save_checkpoint(
-                save_dir / f"checkpoint_epoch{epoch+1}.pt",
-                val_metrics
-            )
-
-            if is_best:
-                self.save_checkpoint(
-                    save_dir / "best_model.pt",
-                    val_metrics
-                )
-                print(f"  ★ New best model! BER (G.729): {self.best_ber:.4f}")
-
-        if writer:
-            writer.close()
-
-        print("\n" + "=" * 60)
-        print("Training Completed!")
-        print(f"Best BER (G.729): {self.best_ber:.4f}")
-        print("=" * 60)
+        return epoch_metrics
 
     def save_checkpoint(
         self,
         path: Path,
-        metrics: Dict[str, float]
+        metrics: Dict[str, float],
+        config: Optional[Dict] = None
     ):
         """체크포인트 저장"""
-        torch.save({
+        checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
-            'optim_g_state_dict': self.optim_g.state_dict(),
-            'optim_d_state_dict': self.optim_d.state_dict(),
-            'scheduler_g_state_dict': self.scheduler_g.state_dict(),
-            'scheduler_d_state_dict': self.scheduler_d.state_dict(),
+            'opt_g_state_dict': self.opt_g.state_dict(),
+            'opt_d_state_dict': self.opt_d.state_dict(),
             'best_ber': self.best_ber,
-            'metrics': metrics,
-            'config': self.config
-        }, path)
+            'metrics': metrics
+        }
+
+        if config is not None:
+            checkpoint['config'] = config
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(checkpoint, path)
 
     def load_checkpoint(self, path: Path):
         """체크포인트 로드"""
         checkpoint = torch.load(path, map_location=self.device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optim_g.load_state_dict(checkpoint['optim_g_state_dict'])
-        self.optim_d.load_state_dict(checkpoint['optim_d_state_dict'])
-        self.scheduler_g.load_state_dict(checkpoint['scheduler_g_state_dict'])
-        self.scheduler_d.load_state_dict(checkpoint['scheduler_d_state_dict'])
+        self.opt_g.load_state_dict(checkpoint['opt_g_state_dict'])
+        self.opt_d.load_state_dict(checkpoint['opt_d_state_dict'])
         self.current_epoch = checkpoint['epoch'] + 1
         self.global_step = checkpoint['global_step']
-        self.best_ber = checkpoint['best_ber']
+        self.best_ber = checkpoint.get('best_ber', 1.0)
 
         print(f"Loaded checkpoint from epoch {checkpoint['epoch']+1}")
         print(f"Best BER: {self.best_ber:.4f}")
 
+        return checkpoint.get('config')
+
+
+# =============================================================================
+# Main Training Function
+# =============================================================================
+
+def train(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    config: Dict[str, Any],
+    save_dir: Path,
+    device: torch.device,
+    resume_path: Optional[Path] = None
+):
+    """
+    메인 학습 함수
+
+    Args:
+        train_loader: 학습 DataLoader
+        val_loader: 검증 DataLoader
+        config: 설정 딕셔너리
+        save_dir: 체크포인트 저장 디렉토리
+        device: 디바이스
+        resume_path: 재개할 체크포인트 경로
+    """
+    # ========================================
+    # 1. Model 초기화
+    # ========================================
+    training_config = config.get('training', {})
+    model_config = config.get('model', {})
+
+    model = CallCopsNet(
+        message_dim=config.get('watermark', {}).get('payload_length', 128),
+        hidden_channels=model_config.get('hidden_channels', [32, 64, 128, 256]),
+        num_residual_blocks=model_config.get('num_residual_blocks', 4),
+        use_discriminator=True
+    ).to(device)
+
+    # 파라미터 수 출력
+    params = model.count_parameters()
+    print(f"\nModel Parameters:")
+    print(f"  Encoder: {params['encoder']:,}")
+    print(f"  Decoder: {params['decoder']:,}")
+    print(f"  Discriminator: {params['discriminator']:,}")
+    print(f"  Total: {params['total']:,}")
+
+    # ========================================
+    # 2. Loss Function
+    # ========================================
+    loss_fn = CallCopsLoss(
+        lambda_bit=training_config.get('lambda_bit', 1.0),
+        lambda_audio=training_config.get('lambda_audio', 10.0),
+        lambda_adv=training_config.get('lambda_adv', 0.1),
+        lambda_det=training_config.get('lambda_det', 0.5),
+        lambda_stft=training_config.get('lambda_stft', 2.0),
+        sample_rate=config.get('audio', {}).get('sample_rate', 8000)
+    ).to(device)
+
+    # ========================================
+    # 3. Optimizers (LR: 2e-4)
+    # ========================================
+    lr = training_config.get('learning_rate', 2e-4)
+    betas = tuple(training_config.get('adam_betas', [0.5, 0.9]))
+
+    opt_g = optim.Adam(
+        list(model.encoder.parameters()) + list(model.decoder.parameters()),
+        lr=lr,
+        betas=betas
+    )
+
+    opt_d = optim.Adam(
+        model.discriminator.parameters(),
+        lr=lr,
+        betas=betas
+    )
+
+    # ========================================
+    # 4. Codec Simulator (Optional)
+    # ========================================
+    codec_sim = None
+    codec_config = config.get('codec', {})
+    if codec_config.get('enabled', False):
+        codec_sim = DifferentiableCodecSimulator(
+            codec_types=codec_config.get('types', ['g711_alaw', 'g729', 'none']),
+            curriculum_epochs=training_config.get('curriculum_epochs', 10)
+        ).to(device)
+
+    # ========================================
+    # 5. Trainer
+    # ========================================
+    trainer = CallCopsTrainer(
+        model=model,
+        loss_fn=loss_fn,
+        opt_g=opt_g,
+        opt_d=opt_d,
+        device=device,
+        codec_sim=codec_sim,
+        grad_clip=training_config.get('grad_clip', 1.0),
+        use_amp=training_config.get('use_amp', False)
+    )
+
+    # 체크포인트 복원
+    if resume_path and resume_path.exists():
+        trainer.load_checkpoint(resume_path)
+
+    # ========================================
+    # 6. Training Loop
+    # ========================================
+    num_epochs = training_config.get('epochs', 100)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("CallCops Training Started")
+    print("=" * 60)
+    print(f"  Device: {device}")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {config.get('training', {}).get('batch_size', 32)}")
+    print(f"  Learning rate: {lr}")
+    print(f"  Training samples: {len(train_loader.dataset)}")
+    print(f"  Validation samples: {len(val_loader.dataset)}")
+    print(f"  Codec simulation: {'Enabled' if codec_sim else 'Disabled'}")
+    print("=" * 60 + "\n")
+
+    for epoch in range(trainer.current_epoch, num_epochs):
+        # Train
+        train_metrics = trainer.train_epoch(train_loader, epoch, num_epochs)
+
+        # Validate
+        val_metrics = trainer.validate(val_loader)
+
+        # Summary
+        print(f"\nEpoch {epoch+1}/{num_epochs} Summary:")
+        print(f"  Train - Loss: {train_metrics['loss_total']:.4f}, "
+              f"BER: {train_metrics['ber']:.4f}, SNR: {train_metrics['snr']:.1f}dB")
+        print(f"  Val   - Loss: {val_metrics['loss']:.4f}, "
+              f"BER: {val_metrics['ber']:.4f}, SNR: {val_metrics['snr']:.1f}dB")
+
+        # Checkpointing
+        is_best = val_metrics['ber'] < trainer.best_ber
+
+        if is_best:
+            trainer.best_ber = val_metrics['ber']
+            trainer.save_checkpoint(
+                save_dir / "best_model.pth",
+                val_metrics,
+                config
+            )
+            print(f"  ★ New best model! BER: {trainer.best_ber:.4f}")
+
+        # 주기적 저장 (10 에포크마다)
+        if (epoch + 1) % 10 == 0:
+            trainer.save_checkpoint(
+                save_dir / f"checkpoint_epoch{epoch+1}.pth",
+                val_metrics,
+                config
+            )
+
+        print()
+
+    # 최종 저장
+    trainer.save_checkpoint(
+        save_dir / "final_model.pth",
+        val_metrics,
+        config
+    )
+
+    print("=" * 60)
+    print("Training Completed!")
+    print(f"Best BER: {trainer.best_ber:.4f}")
+    print(f"Checkpoints saved to: {save_dir}")
+    print("=" * 60)
+
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="CallCops Training")
-    parser.add_argument('--config', type=str, default='configs/default.yaml',
-                        help='Path to config file')
-    parser.add_argument('--data_dir', type=str, default='data/raw/training',
-                        help='Path to training data directory')
-    parser.add_argument('--val_dir', type=str, default='data/raw/validation',
-                        help='Path to validation data directory')
-    parser.add_argument('--save_dir', type=str, default='checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--log_dir', type=str, default='logs',
-                        help='Directory for TensorBoard logs')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from')
-    parser.add_argument('--epochs', type=int, default=None,
-                        help='Number of epochs (overrides config)')
-    parser.add_argument('--batch_size', type=int, default=None,
-                        help='Batch size (overrides config)')
-    parser.add_argument('--device', type=str, default='auto',
-                        help='Device to use (auto, cuda, cpu)')
+    parser = argparse.ArgumentParser(
+        description="CallCops Training Script",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # 데이터 경로
+    parser.add_argument(
+        '--train_dir', type=str, default='data/raw/training',
+        help='Training data directory'
+    )
+    parser.add_argument(
+        '--val_dir', type=str, default='data/raw/validation',
+        help='Validation data directory'
+    )
+
+    # 학습 설정
+    parser.add_argument(
+        '--epochs', type=int, default=100,
+        help='Number of training epochs'
+    )
+    parser.add_argument(
+        '--batch_size', type=int, default=32,
+        help='Batch size'
+    )
+    parser.add_argument(
+        '--lr', type=float, default=2e-4,
+        help='Learning rate'
+    )
+
+    # 모델 설정
+    parser.add_argument(
+        '--message_dim', type=int, default=128,
+        help='Watermark message dimension (bits)'
+    )
+
+    # 경로 설정
+    parser.add_argument(
+        '--config', type=str, default=None,
+        help='Path to config YAML file (overrides CLI args)'
+    )
+    parser.add_argument(
+        '--save_dir', type=str, default='checkpoints',
+        help='Directory to save checkpoints'
+    )
+    parser.add_argument(
+        '--resume', type=str, default=None,
+        help='Path to checkpoint to resume from'
+    )
+
+    # 디바이스 설정
+    parser.add_argument(
+        '--device', type=str, default='auto',
+        choices=['auto', 'cuda', 'cpu'],
+        help='Device to use'
+    )
+    parser.add_argument(
+        '--num_workers', type=int, default=4,
+        help='Number of data loading workers'
+    )
+
+    # 기타
+    parser.add_argument(
+        '--seed', type=int, default=42,
+        help='Random seed'
+    )
 
     args = parser.parse_args()
 
-    # 설정 로드
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    # ========================================
+    # Config 로드 또는 생성
+    # ========================================
+    if args.config and Path(args.config).exists():
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+        print(f"Loaded config from: {args.config}")
+    else:
+        # CLI 인자로 config 생성
+        config = {
+            'audio': {
+                'sample_rate': 8000,
+                'frame_ms': 40
+            },
+            'watermark': {
+                'payload_length': args.message_dim
+            },
+            'model': {
+                'hidden_channels': [32, 64, 128, 256],
+                'num_residual_blocks': 4
+            },
+            'training': {
+                'epochs': args.epochs,
+                'batch_size': args.batch_size,
+                'learning_rate': args.lr,
+                'adam_betas': [0.5, 0.9],
+                'grad_clip': 1.0,
+                'lambda_bit': 1.0,
+                'lambda_audio': 10.0,
+                'lambda_adv': 0.1,
+                'lambda_det': 0.5,
+                'lambda_stft': 2.0
+            },
+            'codec': {
+                'enabled': False,
+                'types': ['g711_alaw', 'g729', 'none']
+            }
+        }
 
-    # CLI 인자로 설정 오버라이드
-    if args.epochs:
-        config['training']['epochs'] = args.epochs
-    if args.batch_size:
-        config['training']['batch_size'] = args.batch_size
+    # CLI 인자로 오버라이드
+    config['training']['epochs'] = args.epochs
+    config['training']['batch_size'] = args.batch_size
+    config['training']['learning_rate'] = args.lr
 
+    # ========================================
     # 디바이스 설정
+    # ========================================
     if args.device == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
 
+    print(f"Using device: {device}")
+
+    if device.type == 'cuda':
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # ========================================
+    # 랜덤 시드
+    # ========================================
+    torch.manual_seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed(args.seed)
+
+    # ========================================
     # DataLoader 생성
-    train_loader = create_dataloader(
-        data_dir=args.data_dir,
+    # ========================================
+    print(f"\nLoading data...")
+
+    train_loader, val_loader = create_train_val_loaders(
+        train_dir=args.train_dir,
+        val_dir=args.val_dir,
         batch_size=config['training']['batch_size'],
-        mode='train',
-        sample_rate=config['audio']['sample_rate'],
-        frame_ms=config['audio']['frame_ms']
+        num_workers=args.num_workers,
+        sample_rate=config['audio']['sample_rate']
     )
 
-    val_dir = args.val_dir or args.data_dir
-    val_loader = create_dataloader(
-        data_dir=val_dir,
-        batch_size=config['training']['batch_size'],
-        mode='val',
-        sample_rate=config['audio']['sample_rate'],
-        frame_ms=config['audio']['frame_ms']
-    )
-
-    # 트레이너 초기화
-    trainer = Trainer(config, device)
-
-    # 체크포인트 복원
-    if args.resume:
-        trainer.load_checkpoint(Path(args.resume))
-
+    # ========================================
     # 저장 디렉토리 설정
+    # ========================================
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     save_dir = Path(args.save_dir) / timestamp
-    log_dir = Path(args.log_dir) / timestamp
 
+    # ========================================
     # 학습 시작
-    trainer.train(
+    # ========================================
+    resume_path = Path(args.resume) if args.resume else None
+
+    train(
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=config['training']['epochs'],
+        config=config,
         save_dir=save_dir,
-        log_dir=log_dir
+        device=device,
+        resume_path=resume_path
     )
 
 
