@@ -467,7 +467,7 @@ def train(
         # 2. Loss Function
         # ========================================
         loss_fn = CallCopsLoss(
-            lambda_bit=training_config.get('lambda_bit', 1.0),
+            lambda_bit=training_config.get('lambda_bit', 10.0),
             lambda_audio=training_config.get('lambda_audio', 10.0),
             lambda_adv=training_config.get('lambda_adv', 0.1),
             lambda_det=training_config.get('lambda_det', 0.5),
@@ -754,7 +754,7 @@ def main():
                 'learning_rate': args.lr,
                 'adam_betas': [0.5, 0.9],
                 'grad_clip': 1.0,
-                'lambda_bit': 1.0,
+                'lambda_bit': 10.0,
                 'lambda_audio': 10.0,
                 'lambda_adv': 0.1,
                 'lambda_det': 0.5,

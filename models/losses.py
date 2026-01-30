@@ -502,7 +502,7 @@ class CallCopsLoss(nn.Module):
 
     def __init__(
         self,
-        lambda_bit: float = 1.0,
+        lambda_bit: float = 10.0,
         lambda_audio: float = 10.0,
         lambda_adv: float = 0.1,
         lambda_det: float = 0.5,
@@ -637,7 +637,7 @@ if __name__ == "__main__":
 
     # 손실 함수 초기화
     loss_fn = CallCopsLoss(
-        lambda_bit=1.0,
+        lambda_bit=10.0,
         lambda_audio=10.0,
         lambda_adv=0.1,
         sample_rate=8000
