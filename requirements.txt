@@ -10,6 +10,7 @@ numpy>=1.26.0
 
 # Configuration
 pyyaml>=6.0
+python-dotenv>=1.0.0     # .env 파일 로드 (Telegram 토큰 등)
 
 # Training & Logging
 tensorboard>=2.10.0
@@ -43,3 +44,9 @@ ipywidgets>=8.0.0
 # Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
+
+# System monitoring & Notifications
+gputil>=1.4.0            # GPU 상태 모니터링
+psutil>=5.9.0            # CPU/RAM 상태 모니터링
+requests>=2.28.0         # Telegram API 호출
+
