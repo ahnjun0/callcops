@@ -12,6 +12,8 @@ from .rtaw_net import (
     ConvBlock,
     ResidualBlock,
     SEBlock,
+    CrossModalFusionBlock,
+    TemporalBitExtractor,
     # Legacy compatibility
     RTAWNet,
     RTAWEncoder,
