@@ -1,6 +1,6 @@
-# CallCops Models
-# ===============
-# Real-Time Audio Watermarking Neural Network Components
+# CallCops Models v2.0
+# ====================
+# Frame-Wise Real-Time Audio Watermarking Neural Network Components
 
 from .rtaw_net import (
     # Main classes
@@ -12,13 +12,16 @@ from .rtaw_net import (
     ConvBlock,
     ResidualBlock,
     SEBlock,
-    CrossModalFusionBlock,
-    TemporalBitExtractor,
-    # Legacy compatibility
-    RTAWNet,
-    RTAWEncoder,
-    RTAWDecoder,
-    MultiResolutionDiscriminator,
+    FrameWiseFusionBlock,
+    FrameWiseBitExtractor,
+    # Constants
+    FRAME_SAMPLES,
+    PAYLOAD_LENGTH,
+    CYCLE_SAMPLES,
+    SAMPLE_RATE,
+    # Utilities
+    align_to_frames,
+    get_cyclic_bit_indices,
 )
 
 from .codec_simulator import (
@@ -45,6 +48,16 @@ __all__ = [
     "ConvBlock",
     "ResidualBlock",
     "SEBlock",
+    "FrameWiseFusionBlock",
+    "FrameWiseBitExtractor",
+    # Constants
+    "FRAME_SAMPLES",
+    "PAYLOAD_LENGTH",
+    "CYCLE_SAMPLES",
+    "SAMPLE_RATE",
+    # Utilities
+    "align_to_frames",
+    "get_cyclic_bit_indices",
     # Codec simulation
     "DifferentiableCodecSimulator",
     "G711Simulator",
@@ -55,9 +68,4 @@ __all__ = [
     "MultiResolutionMelLoss",
     "BitAccuracyLoss",
     "AdversarialLoss",
-    # Legacy
-    "RTAWNet",
-    "RTAWEncoder",
-    "RTAWDecoder",
-    "MultiResolutionDiscriminator",
 ]

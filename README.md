@@ -9,44 +9,41 @@ CallCops은 전화망(8kHz)에서 동작하는 딥러닝 기반 오디오 워터
 - **실시간 처리**: Causal Convolution 기반 < 200ms 지연
 - **고음질 유지**: PESQ ≥ 4.0 (MOS 스케일)
 - **코덱 강건성**: G.711/G.729 압축 후 BER < 5%
-- **모바일 지원**: Android Lite Interpreter 최적화 (< 10MB)
+- **모바일 지원**: ONNX Runtime Web/Mobile 최적화 (< 10MB)
 
 ## 프로젝트 구조
 
 ```
 call/
 ├── configs/
-│   └── default.yaml        # 학습 설정
+│   └── default.yaml          # 학습 설정 (Curriculum Learning)
 ├── models/
-│   ├── rtaw_net.py         # 인코더/디코더/판별기
-│   ├── attention.py        # 마스킹 기반 어텐션
-│   ├── codec_simulator.py  # 미분 가능 코덱 시뮬레이터
-│   └── losses.py           # 복합 손실 함수
+│   ├── rtaw_net.py           # Encoder/Decoder/Discriminator
+│   ├── codec_simulator.py    # 미분 가능 코덱 시뮬레이터
+│   ├── losses.py             # 복합 손실 함수
+│   └── __init__.py           # 모듈 export
 ├── scripts/
-│   ├── train.py            # 학습 스크립트
-│   ├── evaluate.py         # 평가 스크립트
-│   ├── dataset.py          # 데이터 파이프라인
-│   └── export_mobile.py    # 모바일 변환
+│   ├── train.py              # 학습 스크립트
+│   ├── evaluate.py           # 평가 스크립트
+│   ├── dataset.py            # 데이터 파이프라인
+│   ├── export_onnx.py        # ONNX 변환 (Web/Mobile)
+│   └── export_mobile.py      # TorchScript 변환
 ├── utils/
-│   ├── audio_utils.py      # 오디오 처리 유틸리티
-│   └── metrics.py          # 평가 메트릭
+│   ├── audio_utils.py        # 오디오 처리 유틸리티
+│   ├── metrics.py            # 평가 메트릭 (PESQ, BER, SNR)
+│   └── messenger.py          # Telegram 알림
 ├── data/
-│   ├── train/              # 학습 데이터 (*.wav)
-│   ├── val/                # 검증 데이터
-│   └── test/               # 테스트 데이터
-├── checkpoints/            # 모델 체크포인트
-├── logs/                   # TensorBoard 로그
-└── exported/               # 모바일 내보내기 결과
+│   └── raw/                  # AI Hub 데이터셋
+├── checkpoints/              # 모델 체크포인트
+├── exported/                 # ONNX/TorchScript 출력
+└── logs/                     # TensorBoard 로그
 ```
 
 ## 설치
 
 ```bash
-# 저장소 클론
 git clone https://github.com/your-repo/callcops.git
 cd callcops
-
-# 의존성 설치
 pip install -r requirements.txt
 ```
 
@@ -56,88 +53,90 @@ pip install -r requirements.txt
 - PyTorch >= 2.4.0
 - torchaudio >= 2.4.0
 
-## 데이터 준비
-
-`data/train/`, `data/val/`, `data/test/` 폴더에 8kHz WAV 파일을 넣으세요.
-
-**지원 형식**: `.wav`, `.flac`, `.mp3`, `.ogg`
-
-```bash
-data/
-├── train/
-│   ├── call_001.wav
-│   ├── call_002.wav
-│   └── ...
-├── val/
-│   └── ...
-└── test/
-    └── ...
-```
-
-> **참고**: 다른 샘플레이트의 오디오도 자동으로 8kHz로 리샘플링됩니다.
-
 ## 사용법
 
-### 1. 학습
+### 1. 학습 (Curriculum Learning)
 
 ```bash
-python scripts/train.py \
-    --config configs/default.yaml \
-    --data_dir data/train \
-    --val_dir data/val \
-    --epochs 100
-```
+# Phase 1: Bit 우선 학습 (Mode Collapse 방지)
+python scripts/train.py --config configs/default.yaml --epochs 20
 
-**체크포인트에서 재개:**
-```bash
-python scripts/train.py \
+# Background 학습
+nohup stdbuf -oL python3 scripts/train.py \
     --config configs/default.yaml \
-    --data_dir data/train \
-    --resume checkpoints/checkpoint_epoch50.pt
+    --epochs 20 > training.log 2>&1 &
+
+# 체크포인트에서 재개
+python scripts/train.py --resume checkpoints/latest.pth
 ```
 
 ### 2. 평가
 
 ```bash
 python scripts/evaluate.py \
-    --checkpoint checkpoints/best_model.pt \
-    --data_dir data/test \
-    --output results/evaluation.yaml
+    --checkpoint checkpoints/best_model.pth \
+    --data_dir data/raw/validation
 ```
 
-### 3. 모바일 내보내기
+### 3. ONNX 내보내기 (Web/Mobile)
 
 ```bash
-python scripts/export_mobile.py \
-    --checkpoint checkpoints/best_model.pt \
-    --output_dir exported \
-    --formats torchscript lite onnx \
-    --benchmark
+python scripts/export_onnx.py \
+    --checkpoint checkpoints/best_model.pth \
+    --output_dir exported/onnx \
+    --quantize --validate
 ```
 
-## 아키텍처
+출력:
+```
+exported/onnx/
+├── encoder.onnx        # FP32 Encoder
+├── encoder_int8.onnx   # INT8 Quantized
+├── decoder.onnx        # FP32 Decoder
+└── decoder_int8.onnx   # INT8 Quantized
+```
+
+## 아키텍처 (v2.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Training Loop                         │
+│                     CallCopsNet                             │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│   Audio ──► RTAWEncoder ──► Watermarked ──► CodecSim ──┐   │
-│   [B,1,320]     │            [B,1,320]      (G.711/729) │   │
-│                 │                                       │   │
-│                 ├── CausalConv1d                        │   │
-│                 ├── MaskingAttention                    │   │
-│                 └── Perturbation (< 1%)                 │   │
-│                                                         ▼   │
-│   Bits ◄────── RTAWDecoder ◄────────── Degraded Audio  │   │
-│   [B,128]           │                                       │
-│                     ├── TemporalAttention                   │
-│                     └── BitClassifier                       │
+│   Audio [B,1,T] + Message [B,128]                          │
+│         │                                                   │
+│         ▼                                                   │
+│   ┌─────────────────────────────────────┐                  │
+│   │  Encoder                             │                  │
+│   │  ├─ CausalConv1d + SEBlock          │                  │
+│   │  ├─ CrossModalFusionBlock           │ ← Linear O(T)    │
+│   │  └─ Clamped Alpha [0.01, 0.3]       │ ← Mode Collapse 방지│
+│   └─────────────────────────────────────┘                  │
+│         │                                                   │
+│         ▼                                                   │
+│   Watermarked [B,1,T] → CodecSimulator (G.711/G.729)       │
+│         │                                                   │
+│         ▼                                                   │
+│   ┌─────────────────────────────────────┐                  │
+│   │  Decoder                             │                  │
+│   │  ├─ CausalConv1d                    │                  │
+│   │  └─ TemporalBitExtractor            │ ← 시간 정보 보존  │
+│   └─────────────────────────────────────┘                  │
+│         │                                                   │
+│         ▼                                                   │
+│   Bits [B,128]                                             │
 │                                                             │
-│   Loss = λ_bit·BCE + λ_audio·Mel + λ_adv·GAN               │
-│                                                             │
+│   Loss = λ_bit·BCE + λ_audio·Mel + λ_stft·STFT + λ_adv·GAN │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Curriculum Learning
+
+| Phase | Epochs | λ_bit | λ_audio | λ_adv | 목표 |
+|-------|--------|-------|---------|-------|------|
+| 1 | 1-20 | 50.0 | 0.01 | 0.001 | SNR 30-40dB, BER < 0.3 |
+| 2 | 21-40 | 20.0 | 0.5 | 0.05 | SNR 40-45dB, BER < 0.1 |
+| 3 | 41+ | 10.0 | 2.0 | 0.2 | SNR > 45dB, BER < 0.05 |
 
 ## 품질 목표
 
@@ -146,33 +145,22 @@ python scripts/export_mobile.py \
 | PESQ | ≥ 4.0 | 음질 보존 (MOS 스케일) |
 | BER (G.729) | < 5% | 코덱 압축 후 비트 오류율 |
 | 지연 | < 200ms | 실시간 처리 |
-| 모델 크기 | < 10MB | 모바일 배포 |
+| 모델 크기 | < 10MB | ONNX INT8 양자화 |
 
-## 설정
-
-`configs/default.yaml`에서 주요 하이퍼파라미터를 조정할 수 있습니다:
-
-```yaml
-audio:
-  sample_rate: 8000       # 전화망 표준
-  frame_ms: 40            # 40ms 프레임
-
-watermark:
-  payload_length: 128     # 128-bit 페이로드
-
-training:
-  batch_size: 32
-  learning_rate: 0.0001
-  lambda_bit: 1.0         # 비트 손실 가중치
-  lambda_audio: 10.0      # 오디오 품질 가중치
-  lambda_adv: 0.1         # GAN 손실 가중치
-```
-
-## TensorBoard 모니터링
+## 모니터링
 
 ```bash
+# TensorBoard
 tensorboard --logdir logs/
+
+# Telegram 알림 (.env 설정 필요)
+# TELEGRAM_BOT_TOKEN=xxx
+# TELEGRAM_CHAT_ID=xxx
 ```
+
+## Demo
+
+Web Demo (ONNX Runtime Web): [callcops-demo](https://github.com/your-repo/callcops-demo)
 
 ## 라이선스
 

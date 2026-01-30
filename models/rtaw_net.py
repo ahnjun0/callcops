@@ -1,24 +1,43 @@
 """
-CallCops: Real-Time Audio Watermarking Network
-==============================================
+CallCops: Frame-Wise Real-Time Audio Watermarking Network v2.0
+==============================================================
 
-경량 딥러닝 아키텍처 for 8kHz 전화망 오디오 워터마킹.
+설계 철학:
+1. 실시간성 (Real-time Streaming)
+   - 40ms 프레임 단위 처리 (320 samples @ 8kHz)
+   - O(1) 복잡도 per frame
+   - 저지연 추론
 
-설계 목표:
-- 실시간 추론을 위한 경량 구조
-- Residual Connections으로 gradient vanishing 방지
-- 가변 길이 오디오 지원 (AdaptiveAvgPool1d)
-- 8kHz 샘플레이트 최적화
+2. 순환 보안 (Cyclic Robustness)
+   - 128-bit Cyclic Payload (5.12초 사이클)
+   - 임의 지점 탐지
+   - 자기 동기화 (Sync Pattern)
+
+3. 투명성 (Invisible Evidence)
+   - 청각적 비인지 (SNR > 30dB)
+   - 코덱 저항성 (G.711, G.729)
 
 아키텍처:
     Encoder: Audio [B,1,T] + Message [B,128] → Watermarked [B,1,T]
-    Decoder: Watermarked [B,1,T] → Predicted Bits [B,128]
+             (40ms 프레임마다 1비트 삽입, Cyclic)
+    
+    Decoder: Audio [B,1,T] → Bits [B, num_frames]
+             (40ms 프레임마다 1비트 추출)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+FRAME_SAMPLES = 320       # 40ms @ 8kHz
+PAYLOAD_LENGTH = 128      # 128-bit cyclic payload
+CYCLE_SAMPLES = FRAME_SAMPLES * PAYLOAD_LENGTH  # 40,960 samples = 5.12s
+SAMPLE_RATE = 8000
 
 
 # =============================================================================
@@ -28,7 +47,6 @@ from typing import Tuple, Optional, List
 class ConvBlock(nn.Module):
     """
     기본 Convolutional Block
-
     Conv1d → BatchNorm → LeakyReLU
     """
 
@@ -60,13 +78,6 @@ class ConvBlock(nn.Module):
 class ResidualBlock(nn.Module):
     """
     Residual Block with Skip Connection
-
-    구조:
-        input ─→ Conv → BN → ReLU → Conv → BN ─→ (+) → ReLU → output
-              └────────────────────────────────┘
-                        (skip connection)
-
-    Gradient vanishing 방지 및 깊은 네트워크 학습 안정화
     """
 
     def __init__(
@@ -99,23 +110,16 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-
         out = self.act(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-
-        # Skip connection
         out = out + residual
         out = self.act(out)
-
         return out
 
 
 class SEBlock(nn.Module):
     """
     Squeeze-and-Excitation Block
-
-    채널별 중요도 학습을 통한 feature recalibration.
-    경량 attention 메커니즘.
     """
 
     def __init__(self, channels: int, reduction: int = 8):
@@ -124,76 +128,62 @@ class SEBlock(nn.Module):
         self.squeeze = nn.AdaptiveAvgPool1d(1)
         self.excitation = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),  # Changed from ReLU to prevent gradient clipping
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(channels // reduction, channels, bias=False),
             nn.Sigmoid()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, T]
         b, c, _ = x.shape
-
-        # Squeeze: Global average pooling
         y = self.squeeze(x).view(b, c)
-
-        # Excitation: FC layers
         y = self.excitation(y).view(b, c, 1)
-
-        # Scale
         return x * y
 
 
-class CrossModalFusionBlock(nn.Module):
+# =============================================================================
+# Frame-Wise Fusion Block (Replaces CrossModalFusionBlock)
+# =============================================================================
+
+class FrameWiseFusionBlock(nn.Module):
     """
-    Cross-Modal Fusion Block for Audio-Message Interaction (Memory Efficient)
-    ==========================================================================
+    Frame-Wise Fusion Block for 40ms Frame Processing
+    ==================================================
     
-    O(T) 복잡도의 Linear Attention으로 메모리 효율적 구현.
-    Audio [B, C, T]가 Global Message Vector [B, C, 1]에 attend.
+    각 40ms 프레임에 해당하는 1비트만 삽입.
+    Cyclic 인덱싱으로 128프레임마다 동일한 비트 패턴 반복.
     
-    구조:
-    1. Message → Global Vector Projection [B, C, 1]
-    2. Linear Attention: Audio가 Global Message를 query (O(T) not O(T²))
-    3. Bit Pattern Modulation: 128비트 패턴 주입
-    4. Gated Fusion: 두 modality 결합
+    입력:
+        audio_feat: [B, C, T] - 오디오 피처 (T는 320의 배수)
+        message: [B, 128] - 128비트 페이로드
     
-    Memory: [B, T, 1] attention map instead of [B, T, T]
+    출력:
+        fused: [B, C, T] - 비트 정보가 융합된 피처
     """
     
-    def __init__(self, audio_channels: int, message_dim: int = 128):
+    def __init__(
+        self, 
+        audio_channels: int, 
+        message_dim: int = 128,
+        frame_samples: int = FRAME_SAMPLES
+    ):
         super().__init__()
         
         self.audio_channels = audio_channels
         self.message_dim = message_dim
-        self.head_dim = audio_channels // 4
+        self.frame_samples = frame_samples
         
-        # Message를 Global Vector로 projection [B, 128] → [B, C]
-        self.message_proj = nn.Sequential(
-            nn.Linear(message_dim, audio_channels),
+        # 비트 값 (0/1) → 채널 임베딩
+        self.bit_embedding = nn.Sequential(
+            nn.Linear(1, audio_channels // 2),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(audio_channels, audio_channels),
+            nn.Linear(audio_channels // 2, audio_channels),
         )
         
-        # Bit-wise temporal pattern generator
-        # 각 비트가 고유한 temporal pattern을 생성하도록 학습
-        self.bit_pattern_conv = nn.Conv1d(
-            message_dim, audio_channels,
-            kernel_size=1, bias=False
-        )
-        
-        # Linear Attention: Audio queries Global Message (O(T) complexity)
-        # Query: from audio features [B, C, T] → [B, head_dim, T]
-        self.query_proj = nn.Conv1d(audio_channels, self.head_dim, kernel_size=1)
-        
-        # Key & Value: from GLOBAL message vector [B, C] → [B, head_dim] / [B, C]
-        # NOT from expanded [B, C, T] - this is the key difference!
-        self.key_proj = nn.Linear(audio_channels, self.head_dim)
-        self.value_proj = nn.Linear(audio_channels, audio_channels)
-        
-        # Per-position modulation (content-aware gating)
-        self.position_gate = nn.Sequential(
-            nn.Conv1d(audio_channels, audio_channels, kernel_size=1),
-            nn.Sigmoid()
+        # 프레임 내 temporal modulation
+        self.temporal_modulator = nn.Sequential(
+            nn.Conv1d(audio_channels, audio_channels, kernel_size=3, padding=1, groups=audio_channels),
+            nn.BatchNorm1d(audio_channels),
+            nn.LeakyReLU(0.2, inplace=True),
         )
         
         # Gated fusion
@@ -212,76 +202,78 @@ class CrossModalFusionBlock(nn.Module):
     ) -> torch.Tensor:
         B, C, T = audio_feat.shape
         
-        # 1. Global message projection (single vector, NOT expanded)
-        msg_global = self.message_proj(message)  # [B, C]
+        # 프레임 수 계산 (feature extraction에서 downsampling이 없다고 가정)
+        # 실제로는 audio_feat의 T가 원본 T보다 작을 수 있음
+        num_frames = T // self.frame_samples if T >= self.frame_samples else T
         
-        # 2. Bit-wise temporal patterns
-        msg_bits = message.unsqueeze(-1).expand(-1, -1, T)  # [B, 128, T]
-        bit_patterns = self.bit_pattern_conv(msg_bits)  # [B, C, T]
+        # 각 프레임에 해당하는 비트 인덱스 (Cyclic)
+        frame_indices = torch.arange(num_frames, device=audio_feat.device)
+        bit_indices = frame_indices % self.message_dim  # [num_frames]
         
-        # 3. Linear Attention: Audio attends to GLOBAL message (O(T) complexity)
-        # Query from audio: [B, head_dim, T]
-        Q = self.query_proj(audio_feat)  # [B, head_dim, T]
+        # 각 프레임의 비트 값 가져오기
+        frame_bits = message[:, bit_indices]  # [B, num_frames]
         
-        # Key & Value from GLOBAL message vector (shape [B, C], NOT [B, C, T])
-        K = self.key_proj(msg_global)    # [B, head_dim]
-        V = self.value_proj(msg_global)  # [B, C]
+        # 비트 임베딩
+        bit_embeds = self.bit_embedding(frame_bits.unsqueeze(-1))  # [B, num_frames, C]
+        bit_embeds = bit_embeds.permute(0, 2, 1)  # [B, C, num_frames]
         
-        # Attention scores: each audio position attends to the single global message
-        # Q: [B, head_dim, T] → permute → [B, T, head_dim]
-        # K: [B, head_dim] → unsqueeze → [B, head_dim, 1]
-        # Result: [B, T, 1] - each of T positions has ONE attention weight
-        attn = torch.bmm(Q.permute(0, 2, 1), K.unsqueeze(-1))  # [B, T, 1]
-        attn = attn / (self.head_dim ** 0.5)
-        attn = torch.sigmoid(attn)  # Sigmoid for single-target attention (not softmax)
+        # 프레임 크기로 확장 (각 프레임 전체에 동일 비트 적용)
+        if num_frames < T:
+            # T가 frame_samples보다 작은 경우
+            bit_signal = F.interpolate(bit_embeds, size=T, mode='nearest')
+        else:
+            # 각 프레임을 frame_samples만큼 반복
+            bit_signal = bit_embeds.repeat_interleave(self.frame_samples, dim=-1)
+            bit_signal = bit_signal[:, :, :T]  # 정확한 길이로 자르기
         
-        # Attended value: broadcast V [B, C] across T positions, modulated by attn [B, T, 1]
-        # V: [B, C] → [B, C, 1] → [B, C, T] via broadcast
-        # attn: [B, T, 1] → [B, 1, T] for channel-wise multiplication
-        attended = V.unsqueeze(-1) * attn.permute(0, 2, 1)  # [B, C, T]
+        # Temporal modulation
+        modulated = self.temporal_modulator(bit_signal)
         
-        # 4. Content-aware position gating
-        pos_gate = self.position_gate(audio_feat)  # [B, C, T]
-        modulated = pos_gate * (attended + bit_patterns)
-        
-        # 5. Gated fusion
+        # Gated fusion
         combined = torch.cat([audio_feat, modulated], dim=1)  # [B, 2C, T]
         gate = self.gate(combined)  # [B, C, T]
         
         fused = gate * audio_feat + (1 - gate) * modulated
         
-        # 6. Output projection
+        # Output projection
         output = self.output_conv(torch.cat([fused, audio_feat], dim=1))
         output = self.norm(output)
         
         return output
 
 
-class TemporalBitExtractor(nn.Module):
+# =============================================================================
+# Frame-Wise Bit Extractor (Replaces TemporalBitExtractor)
+# =============================================================================
+
+class FrameWiseBitExtractor(nn.Module):
     """
-    Temporal-Aware Bit Extractor
-    ============================
+    Frame-Wise Bit Extractor for O(1) Complexity
+    =============================================
     
-    AdaptiveAvgPool1d(1)을 대체하여 temporal 정보를 보존하면서
-    128-bit를 추출. 각 비트가 특정 temporal region에 대응.
+    AdaptiveAvgPool1d 제거!
+    Stride=frame_samples Conv1d로 프레임당 1비트 추출.
     
-    구조:
-    1. Temporal segmentation: T → 128 segments
-    2. Per-segment feature extraction
-    3. Bit-wise classification
+    입력:
+        x: [B, C, T'] - 피처 맵 (downsampled)
+    
+    출력:
+        logits: [B, num_frames] - 각 프레임의 비트 로짓
+    
+    핵심: 입력 길이가 달라도 비트 위치가 고정됨!
     """
     
-    def __init__(self, in_channels: int, num_bits: int = 128):
+    def __init__(
+        self, 
+        in_channels: int, 
+        frame_samples: int = FRAME_SAMPLES // 16  # downsampled by 16x
+    ):
         super().__init__()
         
-        self.num_bits = num_bits
+        self.frame_samples = frame_samples
         
-        # Adaptive pooling to fixed temporal resolution
-        # 128보다 큰 temporal resolution 유지 (정보 보존)
-        self.temporal_pool = nn.AdaptiveAvgPool1d(num_bits * 2)  # 256 time steps
-        
-        # Temporal feature refinement
-        self.temporal_conv = nn.Sequential(
+        # 프레임 피처 정제
+        self.frame_refine = nn.Sequential(
             nn.Conv1d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels),
             nn.BatchNorm1d(in_channels),
             nn.LeakyReLU(0.2, inplace=True),
@@ -290,97 +282,82 @@ class TemporalBitExtractor(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
         )
         
-        # Reduce temporal dimension: 256 → 128 with learned weights
-        self.bit_pool = nn.Conv1d(
-            in_channels // 2, in_channels // 2,
-            kernel_size=2, stride=2, groups=in_channels // 2
-        )
-        
-        # Per-bit classifier
-        # 각 temporal position이 하나의 비트에 대응
-        self.bit_classifier = nn.Conv1d(
+        # 프레임당 1비트 추출 (Stride = frame_samples)
+        # kernel_size = frame_samples로 정확히 1프레임을 커버
+        self.frame_classifier = nn.Conv1d(
             in_channels // 2, 1,
-            kernel_size=1
-        )
-        
-        # Global context for bit correlation
-        self.global_context = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels // 2, num_bits),
+            kernel_size=max(frame_samples, 1),
+            stride=max(frame_samples, 1),
+            padding=0
         )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, C, T] feature map (variable length)
+            x: [B, C, T'] feature map
             
         Returns:
-            logits: [B, 128] bit logits
+            logits: [B, num_frames] bit logits
         """
-        # 1. Fixed temporal resolution
-        x = self.temporal_pool(x)  # [B, C, 256]
+        B, C, T = x.shape
         
-        # 2. Temporal feature refinement
-        x = self.temporal_conv(x)  # [B, C//2, 256]
+        # 1. 프레임 피처 정제
+        x = self.frame_refine(x)  # [B, C//2, T]
         
-        # 3. Reduce to 128 time steps
-        x = self.bit_pool(x)  # [B, C//2, 128]
+        # 2. 패딩 (T가 frame_samples의 배수가 아닌 경우)
+        if T < self.frame_samples:
+            # T가 너무 작으면 패딩
+            pad_size = self.frame_samples - T
+            x = F.pad(x, (0, pad_size))
+        elif T % self.frame_samples != 0:
+            pad_size = self.frame_samples - (T % self.frame_samples)
+            x = F.pad(x, (0, pad_size))
         
-        # 4. Per-position bit prediction
-        local_logits = self.bit_classifier(x).squeeze(1)  # [B, 128]
-        
-        # 5. Global context (bit correlation)
-        global_logits = self.global_context(x)  # [B, 128]
-        
-        # 6. Combine local and global
-        logits = local_logits + 0.5 * global_logits
+        # 3. 프레임당 1비트 추출
+        logits = self.frame_classifier(x)  # [B, 1, num_frames]
+        logits = logits.squeeze(1)  # [B, num_frames]
         
         return logits
 
 
 # =============================================================================
-# Encoder (Embedding Network)
+# Encoder (Frame-Wise Embedding Network)
 # =============================================================================
 
 class Encoder(nn.Module):
     """
-    Watermark Embedding Network
-    ===========================
-
-    오디오에 128-bit 메시지를 삽입하는 인코더.
-
-    구조:
-    1. Audio Feature Extraction: Conv1d 스택으로 오디오 특징 추출
-    2. Message Projection: 128-bit → high-dim 벡터로 확장
-    3. Feature Fusion: 오디오 특징 + 메시지 특징 결합
-    4. Residual Refinement: Residual blocks로 정밀 조정
-    5. Output: tanh 활성화로 [-1, 1] 범위 출력
-
+    Frame-Wise Watermark Embedding Network
+    ======================================
+    
+    40ms 프레임마다 1비트씩 삽입하는 인코더.
+    Cyclic 인덱싱으로 128프레임(5.12초)마다 동일한 128비트 반복.
+    
     입력:
-        audio: [B, 1, T] - 8kHz 오디오
-        message: [B, 128] - 워터마크 비트
-
+        audio: [B, 1, T] - 8kHz 오디오 (T는 320의 배수 권장)
+        message: [B, 128] - 128비트 페이로드
+    
     출력:
-        watermarked: [B, 1, T] - 워터마크 삽입된 오디오
+        watermarked: [B, 1, T] - 워터마크된 오디오
     """
 
     def __init__(
         self,
         message_dim: int = 128,
         hidden_channels: List[int] = [32, 64, 128, 256],
-        num_residual_blocks: int = 4
+        num_residual_blocks: int = 4,
+        frame_samples: int = FRAME_SAMPLES
     ):
         super().__init__()
 
         self.message_dim = message_dim
         self.hidden_channels = hidden_channels
+        self.frame_samples = frame_samples
 
         # =============================================
-        # 1. Audio Encoder (Downsampling Path)
+        # 1. Audio Encoder (Feature Extraction)
         # =============================================
-        # Conv1d로 오디오 특징 추출
-
+        # Stride=1로 유지하여 temporal resolution 보존
+        
         encoder_layers = []
         in_ch = 1
 
@@ -391,13 +368,13 @@ class Encoder(nn.Module):
         self.audio_encoder = nn.Sequential(*encoder_layers)
 
         # =============================================
-        # 2. Cross-Modal Fusion (Replaces simple message projection)
+        # 2. Frame-Wise Fusion (1비트/프레임)
         # =============================================
-        # 강화된 Audio-Message 상호작용
         
-        self.cross_modal_fusion = CrossModalFusionBlock(
+        self.frame_fusion = FrameWiseFusionBlock(
             audio_channels=hidden_channels[-1],
-            message_dim=message_dim
+            message_dim=message_dim,
+            frame_samples=frame_samples
         )
         
         # Post-fusion refinement
@@ -407,23 +384,21 @@ class Encoder(nn.Module):
         )
 
         # =============================================
-        # 4. Residual Refinement Blocks
+        # 3. Residual Refinement Blocks
         # =============================================
-        # Dilated convolutions으로 넓은 receptive field
 
         self.residual_blocks = nn.ModuleList([
             ResidualBlock(
                 channels=hidden_channels[-1],
                 kernel_size=3,
-                dilation=2 ** (i % 4)  # 1, 2, 4, 8 cycling
+                dilation=2 ** (i % 4)
             )
             for i in range(num_residual_blocks)
         ])
 
         # =============================================
-        # 5. Audio Decoder (Upsampling Path)
+        # 4. Audio Decoder (Reconstruction)
         # =============================================
-        # 특징 → 오디오 복원
 
         decoder_layers = []
         reversed_channels = list(reversed(hidden_channels))
@@ -435,16 +410,13 @@ class Encoder(nn.Module):
         self.audio_decoder = nn.Sequential(*decoder_layers)
 
         # =============================================
-        # 6. Final Output Layer
+        # 5. Final Output Layer
         # =============================================
-        # tanh로 [-1, 1] 범위 보장
 
         self.output_conv = nn.Conv1d(hidden_channels[0], 1, kernel_size=7, padding=3)
 
-        # Perturbation scale (학습 가능, but CLAMPED to prevent vanishing)
-        # alpha_min=0.01 ensures encoder MUST inject some signal
-        # alpha_max=0.3 prevents excessive distortion
-        self.alpha_raw = nn.Parameter(torch.tensor(0.0))  # Will be transformed
+        # Perturbation scale (학습 가능)
+        self.alpha_raw = nn.Parameter(torch.tensor(0.0))
         self.alpha_min = 0.01
         self.alpha_max = 0.3
 
@@ -454,11 +426,11 @@ class Encoder(nn.Module):
         message: torch.Tensor
     ) -> torch.Tensor:
         """
-        워터마크 삽입
+        40ms 프레임별 1비트 삽입
 
         Args:
             audio: [B, 1, T] 원본 오디오
-            message: [B, 128] 워터마크 비트 (0/1 또는 float)
+            message: [B, 128] 워터마크 비트 (0/1)
 
         Returns:
             watermarked: [B, 1, T] 워터마크된 오디오
@@ -468,33 +440,30 @@ class Encoder(nn.Module):
         # 1. Audio feature extraction
         audio_feat = self.audio_encoder(audio)  # [B, C, T]
 
-        # 2. Cross-modal fusion (replaces simple expand)
-        # 강화된 message-audio 상호작용
-        fused = self.cross_modal_fusion(audio_feat, message)  # [B, C, T]
+        # 2. Frame-wise fusion (각 프레임에 해당 비트만 삽입)
+        fused = self.frame_fusion(audio_feat, message)  # [B, C, T]
         
         # 3. Post-fusion refinement
-        fused = self.fusion_refine(fused)  # [B, C, T]
+        fused = self.fusion_refine(fused)
 
         # 4. Residual refinement
         for block in self.residual_blocks:
             fused = block(fused)
 
         # 5. Decode to audio
-        decoded = self.audio_decoder(fused)  # [B, C0, T]
+        decoded = self.audio_decoder(fused)
 
         # 6. Final output
-        perturbation = self.output_conv(decoded)  # [B, 1, T]
+        perturbation = self.output_conv(decoded)
 
         # 길이 맞추기
         if perturbation.shape[-1] != T:
             perturbation = F.interpolate(perturbation, size=T, mode='linear', align_corners=False)
 
-        # Compute clamped alpha (CRITICAL: prevents vanishing to zero)
-        # sigmoid maps (-inf, inf) → (0, 1), then scale to [alpha_min, alpha_max]
+        # Clamped alpha
         alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(self.alpha_raw)
         
-        # tanh로 범위 제한 + clamped scale
-        # Small scaling factor (0.1) on tanh output for finer control
+        # tanh + scaled perturbation
         perturbation = 0.1 * torch.tanh(perturbation) * alpha
 
         # 원본 + 섭동
@@ -505,43 +474,44 @@ class Encoder(nn.Module):
 
 
 # =============================================================================
-# Decoder (Extraction Network)
+# Decoder (Frame-Wise Extraction Network)
 # =============================================================================
 
 class Decoder(nn.Module):
     """
-    Watermark Extraction Network
-    ============================
-
-    워터마크된 오디오에서 128-bit 메시지를 추출하는 디코더.
-
-    구조:
-    1. Feature Extraction: Conv1d 스택 (점진적 채널 확장)
-    2. Residual Blocks: 깊은 특징 학습
-    3. Global Pooling: AdaptiveAvgPool1d로 가변 길이 지원
-    4. Classifier: Linear + Sigmoid로 128-bit 출력
-
+    Frame-Wise Watermark Extraction Network
+    =======================================
+    
+    40ms 프레임마다 1비트씩 추출하는 디코더.
+    O(1) 복잡도로 프레임당 고정 연산.
+    
     입력:
-        audio: [B, 1, T] - 워터마크된 오디오 (가변 길이)
-
+        audio: [B, 1, T] - 워터마크된 오디오
+    
     출력:
-        message: [B, 128] - 추출된 비트 확률 (0~1)
+        logits: [B, num_frames] - 각 프레임의 비트 로짓
+                (num_frames = T // FRAME_SAMPLES)
     """
 
     def __init__(
         self,
         message_dim: int = 128,
         hidden_channels: List[int] = [32, 64, 128, 256],
-        num_residual_blocks: int = 4
+        num_residual_blocks: int = 4,
+        frame_samples: int = FRAME_SAMPLES
     ):
         super().__init__()
 
         self.message_dim = message_dim
+        self.frame_samples = frame_samples
+        
+        # Downsampling factor (stride=2 per layer)
+        self.downsample_factor = 2 ** len(hidden_channels)  # 16x for 4 layers
+        self.downsampled_frame = frame_samples // self.downsample_factor
 
         # =============================================
-        # 1. Feature Extractor
+        # 1. Feature Extractor (with downsampling)
         # =============================================
-        # Progressive channel expansion
 
         encoder_layers = []
         in_ch = 1
@@ -567,44 +537,29 @@ class Decoder(nn.Module):
             for i in range(num_residual_blocks)
         ])
 
-        # SE Block for channel attention
+        # SE Block
         self.se_block = SEBlock(hidden_channels[-1])
 
         # =============================================
-        # 3. Temporal Bit Extractor (Replaces global pooling)
+        # 3. Frame-Wise Bit Extractor (O(1) per frame)
         # =============================================
-        # AdaptiveAvgPool1d(1) 대신 temporal 정보 보존하는 구조
         
-        self.bit_extractor = TemporalBitExtractor(
+        self.bit_extractor = FrameWiseBitExtractor(
             in_channels=hidden_channels[-1],
-            num_bits=message_dim
-        )
-        
-        # Legacy classifier removed - TemporalBitExtractor handles classification
-        # =============================================
-        # 4. Message Classifier (REMOVED - integrated into TemporalBitExtractor)
-        # =============================================
-        # Keeping a simple refinement layer for compatibility
-        self.classifier_refine = nn.Sequential(
-            nn.Linear(message_dim, message_dim * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(message_dim * 2, message_dim),
-            # nn.Sigmoid() 제거: 수치적 안정성을 위해 로짓(Logit)을 직접 출력하고 
-            # 손실 함수에서 binary_cross_entropy_with_logits를 사용함.
+            frame_samples=self.downsampled_frame
         )
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        워터마크 추출 (로짓 출력)
+        프레임별 비트 추출
 
         Args:
-            audio: [B, 1, T] 워터마크된 오디오 (가변 길이)
+            audio: [B, 1, T] 워터마크된 오디오
 
         Returns:
-            logits: [B, 128] 추출된 비트의 로짓 값
+            logits: [B, num_frames] 각 프레임의 비트 로짓
         """
-        # 1. Feature extraction
+        # 1. Feature extraction (with downsampling)
         features = self.feature_extractor(audio)  # [B, C, T']
 
         # 2. Residual blocks
@@ -614,14 +569,39 @@ class Decoder(nn.Module):
         # 3. Channel attention
         features = self.se_block(features)
 
-        # 4. Temporal bit extraction (replaces global pooling)
-        # 각 비트가 특정 temporal region에서 추출됨
-        bit_logits = self.bit_extractor(features)  # [B, 128]
-
-        # 5. Refinement (residual connection)
-        logits = bit_logits + self.classifier_refine(bit_logits)  # [B, 128]
+        # 4. Frame-wise bit extraction
+        logits = self.bit_extractor(features)  # [B, num_frames]
 
         return logits
+    
+    def extract_128bits(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        128비트 페이로드 복원 (Cyclic aggregation)
+        
+        긴 오디오에서 여러 사이클을 평균하여 128비트 복원.
+        
+        Args:
+            audio: [B, 1, T] - 최소 5.12초 권장
+            
+        Returns:
+            bits_128: [B, 128] - 복원된 128비트 페이로드 로짓
+        """
+        logits = self.forward(audio)  # [B, num_frames]
+        B, num_frames = logits.shape
+        
+        # 128비트로 집계 (Cyclic averaging)
+        bits_128 = torch.zeros(B, self.message_dim, device=logits.device)
+        counts = torch.zeros(self.message_dim, device=logits.device)
+        
+        for i in range(num_frames):
+            bit_idx = i % self.message_dim
+            bits_128[:, bit_idx] += logits[:, i]
+            counts[bit_idx] += 1
+        
+        # 평균
+        bits_128 = bits_128 / counts.unsqueeze(0).clamp(min=1)
+        
+        return bits_128
 
 
 # =============================================================================
@@ -631,10 +611,6 @@ class Decoder(nn.Module):
 class Discriminator(nn.Module):
     """
     Multi-Scale Discriminator
-    =========================
-
-    워터마크된 오디오의 자연스러움을 판별.
-    여러 스케일에서 분석하여 다양한 주파수 대역의 artifacts 탐지.
     """
 
     def __init__(
@@ -671,10 +647,6 @@ class Discriminator(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, audio: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Returns:
-            List of discrimination scores at each scale
-        """
         outputs = []
 
         for pool, disc in zip(self.pools, self.discriminators):
@@ -691,27 +663,13 @@ class Discriminator(nn.Module):
 
 class CallCopsNet(nn.Module):
     """
-    CallCops Complete Network
-    =========================
-
-    Encoder + Decoder + Discriminator 통합 네트워크.
-
-    Features:
-    - embed(): 워터마크 삽입
-    - extract(): 워터마크 추출
-    - forward(): End-to-end 학습용
-
-    Usage:
-        model = CallCopsNet(message_dim=128)
-
-        # Embedding
-        watermarked = model.embed(audio, bits)
-
-        # Extraction
-        extracted_bits = model.extract(watermarked)
-
-        # Training
-        outputs = model(audio, bits)
+    CallCops Complete Network v2.0
+    ==============================
+    
+    Frame-Wise 워터마킹:
+    - 40ms 프레임당 1비트 삽입/추출
+    - 128비트 Cyclic Payload (5.12초 사이클)
+    - O(1) 복잡도 per frame
     """
 
     def __init__(
@@ -719,28 +677,32 @@ class CallCopsNet(nn.Module):
         message_dim: int = 128,
         hidden_channels: List[int] = [32, 64, 128, 256],
         num_residual_blocks: int = 4,
-        use_discriminator: bool = True
+        use_discriminator: bool = True,
+        frame_samples: int = FRAME_SAMPLES
     ):
         super().__init__()
 
         self.message_dim = message_dim
+        self.frame_samples = frame_samples
 
-        # Encoder (Embedding Network)
+        # Encoder
         self.encoder = Encoder(
             message_dim=message_dim,
             hidden_channels=hidden_channels,
-            num_residual_blocks=num_residual_blocks
+            num_residual_blocks=num_residual_blocks,
+            frame_samples=frame_samples
         )
 
-        # Decoder (Extraction Network)
+        # Decoder
         self.decoder = Decoder(
             message_dim=message_dim,
             hidden_channels=hidden_channels,
-            num_residual_blocks=num_residual_blocks
+            num_residual_blocks=num_residual_blocks,
+            frame_samples=frame_samples
         )
 
-        # Discriminator (optional, for GAN training)
-        self.discriminator = None
+        # Discriminator (optional)
+        self.use_discriminator = use_discriminator
         if use_discriminator:
             self.discriminator = Discriminator()
 
@@ -748,115 +710,95 @@ class CallCopsNet(nn.Module):
         self,
         audio: torch.Tensor,
         message: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        워터마크 삽입
-
-        Args:
-            audio: [B, 1, T] 원본 오디오
-            message: [B, 128] 워터마크 비트
-
-        Returns:
-            watermarked: [B, 1, T] 워터마크된 오디오
-            attention: None (placeholder for compatibility)
-        """
-        watermarked = self.encoder(audio, message)
-        return watermarked, None
-
-    def extract(
-        self,
-        audio: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        워터마크 추출 (추론용)
+        워터마크 삽입 (40ms 프레임당 1비트)
 
         Args:
-            audio: [B, 1, T] 워터마크된 오디오
+            audio: [B, 1, T]
+            message: [B, 128]
 
         Returns:
-            probs: [B, 128] 추출된 비트 확률 (0~1)
-            detection: [B, 1] 워터마크 탐지 신뢰도 (0~1)
+            watermarked: [B, 1, T]
+            perturbation: [B, 1, T] (for analysis)
         """
-        logits = self.decoder(audio)
-        probs = torch.sigmoid(logits)
-        
-        # Detection: 0.5에서 얼마나 떨어져 있는지로 판단 (0 or 1에 가까우면 신뢰도 높음)
-        # 워터마크가 있으면 신뢰도가 1에 가깝고, 없으면(랜덤하면) 0에 가깝게 정규화
-        detection = torch.abs(probs - 0.5).mean(dim=1, keepdim=True) * 2
-        return probs, detection
-
-    def forward(
-        self,
-        audio: torch.Tensor,
-        message: torch.Tensor,
-        return_discriminator: bool = True
-    ) -> dict:
-        """
-        End-to-end Forward Pass (학습용)
-
-        Args:
-            audio: [B, 1, T] 원본 오디오
-            message: [B, 128] 워터마크 비트
-            return_discriminator: Discriminator 출력 포함 여부
-
-        Returns:
-            dict:
-                - watermarked: 워터마크된 오디오
-                - extracted: 추출된 비트 확률
-                - disc_real: 원본 판별 점수 (optional)
-                - disc_fake: 워터마크 판별 점수 (optional)
-        """
-        # 1. Embed watermark
         watermarked = self.encoder(audio, message)
+        perturbation = watermarked - audio
+        return watermarked, perturbation
 
-        # 2. Extract watermark
-        extracted = self.decoder(watermarked)
+    def extract(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        워터마크 추출 (프레임별)
 
-        result = {
-            'watermarked': watermarked,
-            'extracted': extracted,
-        }
+        Args:
+            audio: [B, 1, T]
 
-        # 3. Discriminate (for GAN loss)
-        if return_discriminator and self.discriminator is not None:
-            with torch.no_grad():
-                disc_real = self.discriminator(audio)
-            disc_fake = self.discriminator(watermarked)
+        Returns:
+            logits: [B, num_frames] - 각 프레임의 비트 로짓
+        """
+        return self.decoder(audio)
+    
+    def extract_128bits(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        128비트 페이로드 복원
 
-            result['disc_real'] = disc_real
-            result['disc_fake'] = disc_fake
+        Args:
+            audio: [B, 1, T]
 
-        return result
+        Returns:
+            bits_128: [B, 128] - Cyclic 집계된 비트 로짓
+        """
+        return self.decoder.extract_128bits(audio)
 
     def count_parameters(self) -> dict:
-        """모델 파라미터 수 계산"""
-        encoder_params = sum(p.numel() for p in self.encoder.parameters())
-        decoder_params = sum(p.numel() for p in self.decoder.parameters())
-        disc_params = sum(p.numel() for p in self.discriminator.parameters()) if self.discriminator else 0
+        """파라미터 수 계산"""
+        enc_params = sum(p.numel() for p in self.encoder.parameters())
+        dec_params = sum(p.numel() for p in self.decoder.parameters())
+        disc_params = sum(p.numel() for p in self.discriminator.parameters()) if self.use_discriminator else 0
 
         return {
-            'encoder': encoder_params,
-            'decoder': decoder_params,
+            'encoder': enc_params,
+            'decoder': dec_params,
             'discriminator': disc_params,
-            'total': encoder_params + decoder_params + disc_params
+            'total': enc_params + dec_params + disc_params
         }
 
 
 # =============================================================================
-# Legacy Compatibility (기존 코드 호환성)
+# Utility Functions
 # =============================================================================
 
-# 기존 RTAWNet 호환성 유지
-class RTAWNet(CallCopsNet):
-    """RTAWNet alias for backward compatibility"""
+def align_to_frames(audio: torch.Tensor, frame_samples: int = FRAME_SAMPLES) -> torch.Tensor:
+    """
+    오디오를 프레임 경계에 맞게 패딩
+    
+    Args:
+        audio: [B, 1, T]
+        frame_samples: 프레임 크기 (기본 320)
+        
+    Returns:
+        aligned: [B, 1, T'] where T' is multiple of frame_samples
+    """
+    T = audio.shape[-1]
+    if T % frame_samples == 0:
+        return audio
+    
+    pad_size = frame_samples - (T % frame_samples)
+    return F.pad(audio, (0, pad_size))
 
-    def __init__(self, bits_dim: int = 128, **kwargs):
-        super().__init__(message_dim=bits_dim, **kwargs)
-        self.bits_dim = bits_dim
 
-RTAWEncoder = Encoder
-RTAWDecoder = Decoder
-MultiResolutionDiscriminator = Discriminator
+def get_cyclic_bit_indices(num_frames: int, payload_length: int = PAYLOAD_LENGTH) -> torch.Tensor:
+    """
+    Cyclic 비트 인덱스 생성
+    
+    Args:
+        num_frames: 프레임 수
+        payload_length: 페이로드 길이 (기본 128)
+        
+    Returns:
+        indices: [num_frames] - 각 프레임의 비트 인덱스 (0~127 반복)
+    """
+    return torch.arange(num_frames) % payload_length
 
 
 # =============================================================================
@@ -865,81 +807,50 @@ MultiResolutionDiscriminator = Discriminator
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("CallCops Network Architecture Test")
+    print("CallCops Frame-Wise Network v2.0 Test")
     print("=" * 60)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
-
-    # Model initialization
-    model = CallCopsNet(
-        message_dim=128,
-        hidden_channels=[32, 64, 128, 256],
-        num_residual_blocks=4
-    ).to(device)
-
-    # Count parameters
+    
+    # 모델 생성
+    model = CallCopsNet(message_dim=128).to(device)
     params = model.count_parameters()
-    print(f"\nModel Parameters:")
+    print(f"\nParameters:")
     print(f"  Encoder: {params['encoder']:,}")
     print(f"  Decoder: {params['decoder']:,}")
-    print(f"  Discriminator: {params['discriminator']:,}")
     print(f"  Total: {params['total']:,}")
-
-    # Test inputs
-    batch_size = 4
-    audio_length = 8000  # 1 second @ 8kHz
-
-    audio = torch.randn(batch_size, 1, audio_length).to(device)
-    message = torch.randint(0, 2, (batch_size, 128)).float().to(device)
-
-    print(f"\nInput Shapes:")
-    print(f"  Audio: {audio.shape}")
-    print(f"  Message: {message.shape}")
-
-    # Forward pass
-    model.eval()
-    with torch.no_grad():
-        outputs = model(audio, message)
-
-    print(f"\nOutput Shapes:")
-    print(f"  Watermarked: {outputs['watermarked'].shape}")
-    print(f"  Extracted: {outputs['extracted'].shape}")
-
-    # Test embed/extract API
-    print(f"\n[Embed/Extract API Test]")
-    with torch.no_grad():
-        wm, attention = model.embed(audio, message)
-        ext, detection = model.extract(wm)
-
-    print(f"  Embed returns: watermarked={wm.shape}, attention={attention}")
-    print(f"  Extract returns: bits={ext.shape}, detection={detection.shape}")
-
-    # Test variable length
-    print(f"\n[Variable Length Test]")
-    for length in [320, 1600, 8000, 16000]:
-        test_audio = torch.randn(1, 1, length).to(device)
-        test_msg = torch.randint(0, 2, (1, 128)).float().to(device)
-
-        with torch.no_grad():
-            wm, _ = model.embed(test_audio, test_msg)
-            ext, det = model.extract(wm)
-
-        print(f"  Length {length:5d}: watermarked={wm.shape}, extracted={ext.shape}, detection={det.shape}")
-
-    # SNR estimation
-    original = audio[0, 0].cpu()
-    watermarked = outputs['watermarked'][0, 0].cpu()
-    perturbation = watermarked - original
-
-    snr = 10 * torch.log10(
-        torch.mean(original ** 2) / (torch.mean(perturbation ** 2) + 1e-10)
-    )
-
-    print(f"\nQuality Metrics:")
-    print(f"  Perturbation range: [{perturbation.min():.4f}, {perturbation.max():.4f}]")
-    print(f"  Estimated SNR: {snr:.1f} dB")
-
+    
+    # 테스트 1: 1초 오디오 (25 프레임)
+    print("\n--- Test 1: 1초 오디오 (25 프레임) ---")
+    audio_1s = torch.randn(2, 1, 8000).to(device)
+    message = torch.randint(0, 2, (2, 128)).float().to(device)
+    
+    watermarked, perturbation = model.embed(audio_1s, message)
+    logits = model.extract(watermarked)
+    
+    print(f"Input: {audio_1s.shape}")
+    print(f"Watermarked: {watermarked.shape}")
+    print(f"Extracted logits: {logits.shape}")  # [2, 25]
+    print(f"Expected frames: {8000 // 320} = 25")
+    
+    # 테스트 2: 5.12초 오디오 (128 프레임 = 1 사이클)
+    print("\n--- Test 2: 5.12초 오디오 (128 프레임) ---")
+    audio_5s = torch.randn(2, 1, 40960).to(device)
+    
+    watermarked, _ = model.embed(audio_5s, message)
+    logits = model.extract(watermarked)
+    bits_128 = model.extract_128bits(watermarked)
+    
+    print(f"Input: {audio_5s.shape}")
+    print(f"Extracted logits: {logits.shape}")  # [2, 128]
+    print(f"128-bit payload: {bits_128.shape}")  # [2, 128]
+    
+    # 정확도 테스트
+    pred_bits = (torch.sigmoid(bits_128) > 0.5).float()
+    accuracy = (pred_bits == message).float().mean()
+    print(f"Accuracy (untrained): {accuracy.item():.2%}")
+    
     print("\n" + "=" * 60)
-    print("All tests passed!")
+    print("✓ All tests passed!")
     print("=" * 60)

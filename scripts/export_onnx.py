@@ -26,6 +26,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Project path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -69,17 +70,23 @@ class EncoderONNXWrapper(nn.Module):
 
 class DecoderONNXWrapper(nn.Module):
     """
-    Decoder ONNX Wrapper
-    ====================
+    Decoder ONNX Wrapper v2.0
+    =========================
     
-    Watermarked Audio → Bit Probabilities
+    Frame-Wise Decoder compatible wrapper.
+    Returns frame-wise bit probabilities.
     
-    Detection score 제거 (단일 출력으로 단순화).
+    Watermarked Audio → Frame-wise Bit Probabilities
     """
     
-    def __init__(self, decoder: Decoder):
+    def __init__(self, decoder: Decoder, target_length: int = 8000):
         super().__init__()
         self.decoder = decoder
+        self.target_length = target_length
+        
+        # Frame configuration
+        self.frame_samples = 320  # 40ms @ 8kHz
+        self.expected_frames = target_length // self.frame_samples  # 25 frames for 1s
     
     def forward(
         self,
@@ -87,12 +94,15 @@ class DecoderONNXWrapper(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            audio: [B, 1, T] - Watermarked audio (variable length)
+            audio: [B, 1, T] - Watermarked audio (fixed length = target_length)
             
         Returns:
-            bit_probs: [B, 128] - Extracted bit probabilities (0~1)
+            bit_probs: [B, num_frames] - Extracted bit probabilities per frame
         """
-        logits = self.decoder(audio)
+        # Run through decoder (new frame-wise architecture)
+        logits = self.decoder(audio)  # [B, num_frames]
+        
+        # Sigmoid for probabilities
         probs = torch.sigmoid(logits)
         return probs
 
@@ -150,19 +160,25 @@ def export_decoder_onnx(
     opset_version: int = 16,
     example_length: int = 8000
 ) -> Path:
-    """Decoder를 ONNX로 export"""
+    """Decoder를 ONNX로 export (Frame-Wise v2.0)
     
-    wrapper = DecoderONNXWrapper(decoder)
+    New architecture uses fixed stride Conv1d instead of AdaptiveAvgPool1d,
+    so dynamic audio length is now supported!
+    
+    Output: [B, num_frames] where num_frames = audio_length // 320
+    """
+    
+    wrapper = DecoderONNXWrapper(decoder, target_length=example_length)
     wrapper.eval()
     
     # Example input
     batch_size = 1
     example_audio = torch.randn(batch_size, 1, example_length)
     
-    # Dynamic axes
+    # Dynamic axes - both batch_size AND audio_length are now dynamic!
     dynamic_axes = {
         'audio': {0: 'batch_size', 2: 'audio_length'},
-        'bit_probs': {0: 'batch_size'}
+        'bit_probs': {0: 'batch_size', 1: 'num_frames'}
     }
     
     # Export
@@ -181,6 +197,7 @@ def export_decoder_onnx(
     
     print(f"✅ Decoder exported: {output_path}")
     print(f"   Size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+    print(f"   Output: [B, num_frames] (num_frames = audio_length // 320)")
     
     return output_path
 

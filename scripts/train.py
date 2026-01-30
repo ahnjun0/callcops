@@ -73,18 +73,43 @@ def compute_snr(original: torch.Tensor, watermarked: torch.Tensor) -> float:
 
 def compute_ber(pred_logits: torch.Tensor, target_bits: torch.Tensor) -> float:
     """
-    Bit Error Rate 계산
+    Bit Error Rate 계산 (프레임 단위 호환)
 
     Args:
-        pred_logits: [B, 128] 예측된 로짓
-        target_bits: [B, 128] 목표 비트
+        pred_logits: [B, num_frames] 예측된 로짓 (프레임별)
+        target_bits: [B, 128] 또는 [B, num_frames] 목표 비트
 
     Returns:
         BER (0~1)
     """
+    B, num_frames = pred_logits.shape
+    
+    # target_bits를 프레임 수에 맞게 확장 (Cyclic)
+    if target_bits.shape[1] != num_frames:
+        # target_bits: [B, 128] -> [B, num_frames]
+        frame_indices = torch.arange(num_frames, device=target_bits.device) % target_bits.shape[1]
+        target_bits_expanded = target_bits[:, frame_indices]
+    else:
+        target_bits_expanded = target_bits
+    
     pred_bits = (torch.sigmoid(pred_logits) > 0.5).float()
-    errors = (pred_bits != target_bits).float()
+    errors = (pred_bits != target_bits_expanded).float()
     return errors.mean().item()
+
+
+def get_frame_target_bits(bits: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """
+    128비트 페이로드를 프레임 수에 맞게 Cyclic 확장
+    
+    Args:
+        bits: [B, 128] 원본 페이로드
+        num_frames: 타겟 프레임 수
+        
+    Returns:
+        frame_bits: [B, num_frames] 프레임별 비트
+    """
+    frame_indices = torch.arange(num_frames, device=bits.device) % bits.shape[1]
+    return bits[:, frame_indices]
 
 
 # =============================================================================
@@ -199,23 +224,26 @@ class CallCopsTrainer:
                 watermarked_degraded = watermarked
                 codec_used = 'none'
 
-            # Decoder forward (returns logits)
-            pred_logits = self.model.decoder(watermarked_degraded)
+            # Decoder forward (returns frame-wise logits)
+            pred_logits = self.model.decoder(watermarked_degraded)  # [B, num_frames]
+
+            # 프레임 수에 맞게 타겟 비트 확장 (Cyclic)
+            num_frames = pred_logits.shape[1]
+            target_bits_expanded = get_frame_target_bits(bits, num_frames)
 
             # Detection logits: 비트 로짓의 절대값 평균
-            # 워터마크가 있으면 로짓이 0에서 멀어짐 -> 절대값 큼 -> Detection score 높음
             detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
 
             # Discriminator forward (for generator loss)
             disc_fake = self.model.discriminator(watermarked)
 
-            # Generator losses
+            # Generator losses (프레임 단위 비트 비교)
             losses = self.loss_fn(
                 pred_audio=watermarked,
                 target_audio=audio,
-                pred_bits=pred_logits,  # logits
-                target_bits=bits,
-                detection_pred=detection_logits,  # logits
+                pred_bits=pred_logits,  # [B, num_frames] logits
+                target_bits=target_bits_expanded,  # [B, num_frames] expanded
+                detection_pred=detection_logits,
                 disc_fake=disc_fake
             )
             
@@ -284,15 +312,20 @@ class CallCopsTrainer:
 
             # Forward
             watermarked, _ = self.model.embed(audio, bits)
-            pred_logits = self.model.decoder(watermarked)
+            pred_logits = self.model.decoder(watermarked)  # [B, num_frames]
+            
+            # 프레임 수에 맞게 타겟 비트 확장 (Cyclic)
+            num_frames = pred_logits.shape[1]
+            target_bits_expanded = get_frame_target_bits(bits, num_frames)
+            
             detection_logits = torch.abs(pred_logits).mean(dim=1, keepdim=True)
 
-            # Losses
+            # Losses (프레임 단위 비교)
             losses = self.loss_fn(
                 pred_audio=watermarked,
                 target_audio=audio,
                 pred_bits=pred_logits,
-                target_bits=bits,
+                target_bits=target_bits_expanded,
                 detection_pred=detection_logits
             )
 
