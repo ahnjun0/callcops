@@ -56,8 +56,8 @@ training:
 
 # 코덱 시뮬레이터
 codec:
-  enabled: false             # 초기 학습 시에는 끔
-  types: ["g711_alaw", "g711_ulaw", "g729", "none"] # none 포함 (원본 보존 학습)
+  enabled: true              # 코덱 강건성 학습 활성화!
+  types: ["g711_alaw", "g711_ulaw", "g729", "amr_nb", "none"]  # AMR-NB 추가!
   g711_bits: 8               # 8-bit 양자화
   g729_bitrate: 8000         # 8kbps
 

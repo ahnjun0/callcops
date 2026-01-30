@@ -385,6 +385,153 @@ class G729Simulator(nn.Module):
         return x
 
 
+class AMRNBSimulator(nn.Module):
+    """
+    AMR-NB Codec Simulator (Approximation)
+    ======================================
+
+    Adaptive Multi-Rate Narrowband - VoLTE/3G 음성 통화 표준.
+
+    AMR-NB 특성:
+    - 8 가지 비트레이트: 4.75, 5.15, 5.9, 6.7, 7.4, 7.95, 10.2, 12.2 kbps
+    - ACELP (Algebraic Code-Excited Linear Prediction) 기반
+    - 8kHz 샘플링, 20ms 프레임
+    - 동적 비트레이트 전환 (네트워크 상태에 따라)
+
+    시뮬레이션 방법:
+    1. 비트레이트에 따른 양자화 노이즈
+    2. 20ms 프레임 기반 처리
+    3. ACELP 스펙트럼 평활화 효과
+    4. VAD (Voice Activity Detection) 효과
+    """
+
+    BITRATE_MODES = {
+        'MR475': {'bitrate': 4750, 'noise_std': 0.045, 'lpf_freq': 0.65},
+        'MR515': {'bitrate': 5150, 'noise_std': 0.040, 'lpf_freq': 0.70},
+        'MR59':  {'bitrate': 5900, 'noise_std': 0.035, 'lpf_freq': 0.75},
+        'MR67':  {'bitrate': 6700, 'noise_std': 0.030, 'lpf_freq': 0.78},
+        'MR74':  {'bitrate': 7400, 'noise_std': 0.025, 'lpf_freq': 0.80},
+        'MR795': {'bitrate': 7950, 'noise_std': 0.022, 'lpf_freq': 0.82},
+        'MR102': {'bitrate': 10200, 'noise_std': 0.018, 'lpf_freq': 0.85},
+        'MR122': {'bitrate': 12200, 'noise_std': 0.015, 'lpf_freq': 0.88},
+    }
+
+    def __init__(
+        self,
+        mode: str = 'MR122',  # Default: highest quality
+        frame_size: int = 160,  # 20ms @ 8kHz
+        random_mode: bool = True  # Randomly select mode during training
+    ):
+        super().__init__()
+
+        self.mode = mode
+        self.frame_size = frame_size
+        self.random_mode = random_mode
+
+        # Get mode parameters
+        mode_params = self.BITRATE_MODES.get(mode, self.BITRATE_MODES['MR122'])
+        self.noise_std = mode_params['noise_std']
+        self.lpf_freq = mode_params['lpf_freq']
+
+        # Low-pass filter (ACELP spectral envelope smoothing)
+        self.lpf = nn.Conv1d(1, 1, kernel_size=7, padding=3, bias=False)
+        with torch.no_grad():
+            lpf_kernel = torch.tensor([0.05, 0.1, 0.2, 0.3, 0.2, 0.1, 0.05]).view(1, 1, -1)
+            self.lpf.weight.copy_(lpf_kernel)
+
+        # ACELP residual processing
+        self.acelp_process = nn.Sequential(
+            nn.Conv1d(1, 4, kernel_size=11, padding=5),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(4, 1, kernel_size=11, padding=5),
+        )
+
+        # Frame quantization levels (depends on bitrate)
+        self.frame_quantize_levels = 32  # 5-bit approximation
+
+    def get_random_mode_params(self) -> tuple:
+        """학습 시 랜덤 비트레이트 모드 선택"""
+        modes = list(self.BITRATE_MODES.keys())
+        mode = modes[torch.randint(0, len(modes), (1,)).item()]
+        params = self.BITRATE_MODES[mode]
+        return params['noise_std'], params['lpf_freq'], mode
+
+    def add_frame_quantization(
+        self,
+        x: torch.Tensor,
+        noise_std: float
+    ) -> torch.Tensor:
+        """프레임 단위 양자화 + 노이즈"""
+        B, C, T = x.shape
+
+        # Pad to frame boundary
+        pad_len = (self.frame_size - T % self.frame_size) % self.frame_size
+        if pad_len > 0:
+            x = F.pad(x, (0, pad_len))
+
+        # Reshape to frames [B, C, num_frames, frame_size]
+        num_frames = x.shape[-1] // self.frame_size
+        x_frames = x.view(B, C, num_frames, self.frame_size)
+
+        # Frame energy for normalization
+        frame_energy = torch.sqrt(torch.mean(x_frames ** 2, dim=-1, keepdim=True) + 1e-8)
+
+        # Normalize, quantize, add noise
+        x_norm = x_frames / (frame_energy + 1e-8)
+
+        if self.training:
+            noise = torch.randn_like(x_norm) * noise_std
+            x_quantized = x_norm + noise
+        else:
+            x_quantized = straight_through_quantize(x_norm.flatten(), self.frame_quantize_levels)
+            x_quantized = x_quantized.view_as(x_norm)
+
+        # Restore energy
+        x_restored = x_quantized * frame_energy
+
+        # Reshape back
+        x_out = x_restored.view(B, C, -1)
+
+        # Remove padding
+        if pad_len > 0:
+            x_out = x_out[:, :, :-pad_len]
+
+        return x_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        AMR-NB codec simulation
+
+        Args:
+            x: [B, 1, T] 입력 오디오
+
+        Returns:
+            [B, 1, T] 코덱 처리된 오디오
+        """
+        # Get mode parameters (random during training for robustness)
+        if self.training and self.random_mode:
+            noise_std, lpf_freq, _ = self.get_random_mode_params()
+        else:
+            mode_params = self.BITRATE_MODES.get(self.mode, self.BITRATE_MODES['MR122'])
+            noise_std = mode_params['noise_std']
+
+        # 1. Low-pass filtering (ACELP bandwidth limit)
+        x = self.lpf(x)
+
+        # 2. Frame-based quantization
+        x = self.add_frame_quantization(x, noise_std)
+
+        # 3. ACELP residual processing
+        residual = x
+        x = self.acelp_process(x)
+        x = x + 0.6 * residual  # Skip connection
+
+        # 4. Clipping
+        x = torch.clamp(x, -1.0, 1.0)
+
+        return x
+
+
 class DifferentiableCodecSimulator(nn.Module):
     """
     Differentiable Codec Simulator (통합 모듈)
@@ -397,6 +544,7 @@ class DifferentiableCodecSimulator(nn.Module):
     - G.711 A-law (한국/유럽 표준)
     - G.711 μ-law (북미 표준)
     - G.729 (VoIP, 저대역폭)
+    - AMR-NB (VoLTE/3G, 8가지 비트레이트)
     - Pass-through (코덱 없음)
 
     학습 전략:
@@ -406,7 +554,7 @@ class DifferentiableCodecSimulator(nn.Module):
 
     def __init__(
         self,
-        codec_types: List[str] = ["g711_alaw", "g711_ulaw", "g729", "none"],
+        codec_types: List[str] = ["g711_alaw", "g711_ulaw", "g729", "amr_nb", "none"],
         codec_probs: Optional[List[float]] = None,
         curriculum_epochs: int = 10  # Curriculum learning epochs
     ):
@@ -430,6 +578,8 @@ class DifferentiableCodecSimulator(nn.Module):
                 self.codecs[codec_type] = G711Simulator(companding="mulaw")
             elif codec_type == "g729":
                 self.codecs[codec_type] = G729Simulator()
+            elif codec_type == "amr_nb":
+                self.codecs[codec_type] = AMRNBSimulator()
             elif codec_type == "none":
                 self.codecs[codec_type] = nn.Identity()
             else:
