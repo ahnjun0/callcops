@@ -81,10 +81,10 @@ python scripts/evaluate.py \
 ### 3. ONNX 내보내기 (Web/Mobile)
 
 ```bash
-python scripts/export_onnx.py \
+`python scripts/export_onnx.py \
     --checkpoint checkpoints/best_model.pth \
     --output_dir exported/onnx \
-    --quantize --validate
+    --quantize --validate`
 ```
 
 출력:
