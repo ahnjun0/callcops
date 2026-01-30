@@ -124,7 +124,7 @@ class SEBlock(nn.Module):
         self.squeeze = nn.AdaptiveAvgPool1d(1)
         self.excitation = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.2, inplace=True),  # Changed from ReLU to prevent gradient clipping
             nn.Linear(channels // reduction, channels, bias=False),
             nn.Sigmoid()
         )
@@ -141,6 +141,178 @@ class SEBlock(nn.Module):
 
         # Scale
         return x * y
+
+
+class CrossModalFusionBlock(nn.Module):
+    """
+    Cross-Modal Fusion Block for Audio-Message Interaction
+    ========================================================
+    
+    기존 단순 expand() 대신 학습된 projection + attention으로
+    message와 audio feature 간 강한 상호작용 유도.
+    
+    구조:
+    1. Message → Temporal Projection (학습된 확장)
+    2. Cross-Attention: Audio가 Message를 query
+    3. Gated Fusion: 두 modality 결합
+    """
+    
+    def __init__(self, audio_channels: int, message_dim: int = 128):
+        super().__init__()
+        
+        self.audio_channels = audio_channels
+        self.message_dim = message_dim
+        
+        # Message를 audio와 같은 차원으로 projection
+        self.message_proj = nn.Sequential(
+            nn.Linear(message_dim, audio_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(audio_channels, audio_channels),
+        )
+        
+        # Bit-wise temporal pattern generator
+        # 각 비트가 고유한 temporal pattern을 생성하도록 학습
+        self.bit_pattern_conv = nn.Conv1d(
+            message_dim, audio_channels,
+            kernel_size=1, bias=False
+        )
+        
+        # Cross-attention: Audio queries Message
+        self.query_proj = nn.Conv1d(audio_channels, audio_channels // 4, kernel_size=1)
+        self.key_proj = nn.Linear(audio_channels, audio_channels // 4)
+        self.value_proj = nn.Linear(audio_channels, audio_channels)
+        
+        # Gated fusion
+        self.gate = nn.Sequential(
+            nn.Conv1d(audio_channels * 2, audio_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        self.output_conv = nn.Conv1d(audio_channels * 2, audio_channels, kernel_size=3, padding=1)
+        self.norm = nn.BatchNorm1d(audio_channels)
+        
+    def forward(
+        self,
+        audio_feat: torch.Tensor,  # [B, C, T]
+        message: torch.Tensor       # [B, 128]
+    ) -> torch.Tensor:
+        B, C, T = audio_feat.shape
+        
+        # 1. Global message context (broadcast across time)
+        msg_global = self.message_proj(message)  # [B, C]
+        msg_global = msg_global.unsqueeze(-1).expand(-1, -1, T)  # [B, C, T]
+        
+        # 2. Bit-wise temporal patterns
+        # 각 비트를 temporal axis에 spread하여 고유한 패턴 생성
+        msg_bits = message.unsqueeze(-1)  # [B, 128, 1]
+        msg_bits = msg_bits.expand(-1, -1, T)  # [B, 128, T]
+        bit_patterns = self.bit_pattern_conv(msg_bits)  # [B, C, T]
+        
+        # 3. Cross-attention: Audio가 Message 정보를 선택적으로 attend
+        Q = self.query_proj(audio_feat)  # [B, C//4, T]
+        K = self.key_proj(msg_global.permute(0, 2, 1))  # [B, T, C//4]
+        V = self.value_proj(msg_global.permute(0, 2, 1))  # [B, T, C]
+        
+        # Attention scores
+        attn = torch.bmm(Q.permute(0, 2, 1), K.permute(0, 2, 1))  # [B, T, T]
+        attn = attn / (C // 4) ** 0.5
+        attn = F.softmax(attn, dim=-1)
+        
+        attended = torch.bmm(attn, V).permute(0, 2, 1)  # [B, C, T]
+        
+        # 4. Gated fusion
+        combined = torch.cat([audio_feat, attended + bit_patterns], dim=1)  # [B, 2C, T]
+        gate = self.gate(combined)  # [B, C, T]
+        
+        fused = gate * audio_feat + (1 - gate) * (attended + bit_patterns)
+        
+        # 5. Output projection
+        output = self.output_conv(torch.cat([fused, audio_feat], dim=1))
+        output = self.norm(output)
+        
+        return output
+
+
+class TemporalBitExtractor(nn.Module):
+    """
+    Temporal-Aware Bit Extractor
+    ============================
+    
+    AdaptiveAvgPool1d(1)을 대체하여 temporal 정보를 보존하면서
+    128-bit를 추출. 각 비트가 특정 temporal region에 대응.
+    
+    구조:
+    1. Temporal segmentation: T → 128 segments
+    2. Per-segment feature extraction
+    3. Bit-wise classification
+    """
+    
+    def __init__(self, in_channels: int, num_bits: int = 128):
+        super().__init__()
+        
+        self.num_bits = num_bits
+        
+        # Adaptive pooling to fixed temporal resolution
+        # 128보다 큰 temporal resolution 유지 (정보 보존)
+        self.temporal_pool = nn.AdaptiveAvgPool1d(num_bits * 2)  # 256 time steps
+        
+        # Temporal feature refinement
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels),
+            nn.BatchNorm1d(in_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(in_channels, in_channels // 2, kernel_size=1),
+            nn.BatchNorm1d(in_channels // 2),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        
+        # Reduce temporal dimension: 256 → 128 with learned weights
+        self.bit_pool = nn.Conv1d(
+            in_channels // 2, in_channels // 2,
+            kernel_size=2, stride=2, groups=in_channels // 2
+        )
+        
+        # Per-bit classifier
+        # 각 temporal position이 하나의 비트에 대응
+        self.bit_classifier = nn.Conv1d(
+            in_channels // 2, 1,
+            kernel_size=1
+        )
+        
+        # Global context for bit correlation
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels // 2, num_bits),
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, T] feature map (variable length)
+            
+        Returns:
+            logits: [B, 128] bit logits
+        """
+        # 1. Fixed temporal resolution
+        x = self.temporal_pool(x)  # [B, C, 256]
+        
+        # 2. Temporal feature refinement
+        x = self.temporal_conv(x)  # [B, C//2, 256]
+        
+        # 3. Reduce to 128 time steps
+        x = self.bit_pool(x)  # [B, C//2, 128]
+        
+        # 4. Per-position bit prediction
+        local_logits = self.bit_classifier(x).squeeze(1)  # [B, 128]
+        
+        # 5. Global context (bit correlation)
+        global_logits = self.global_context(x)  # [B, 128]
+        
+        # 6. Combine local and global
+        logits = local_logits + 0.5 * global_logits
+        
+        return logits
 
 
 # =============================================================================
@@ -195,25 +367,19 @@ class Encoder(nn.Module):
         self.audio_encoder = nn.Sequential(*encoder_layers)
 
         # =============================================
-        # 2. Message Projection
+        # 2. Cross-Modal Fusion (Replaces simple message projection)
         # =============================================
-        # 128-bit → hidden_dim으로 확장
-
-        self.message_fc = nn.Sequential(
-            nn.Linear(message_dim, hidden_channels[-1]),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_channels[-1], hidden_channels[-1]),
-            nn.LeakyReLU(0.2, inplace=True),
+        # 강화된 Audio-Message 상호작용
+        
+        self.cross_modal_fusion = CrossModalFusionBlock(
+            audio_channels=hidden_channels[-1],
+            message_dim=message_dim
         )
-
-        # =============================================
-        # 3. Fusion Layer
-        # =============================================
-        # Audio features + Message features 결합
-
-        self.fusion_conv = nn.Sequential(
-            ConvBlock(hidden_channels[-1] * 2, hidden_channels[-1], kernel_size=3, padding=1),
-            SEBlock(hidden_channels[-1]),  # Channel attention
+        
+        # Post-fusion refinement
+        self.fusion_refine = nn.Sequential(
+            ConvBlock(hidden_channels[-1], hidden_channels[-1], kernel_size=3, padding=1),
+            SEBlock(hidden_channels[-1]),
         )
 
         # =============================================
@@ -251,8 +417,12 @@ class Encoder(nn.Module):
 
         self.output_conv = nn.Conv1d(hidden_channels[0], 1, kernel_size=7, padding=3)
 
-        # Perturbation scale (학습 가능)
-        self.alpha = nn.Parameter(torch.tensor(0.1))
+        # Perturbation scale (학습 가능, but CLAMPED to prevent vanishing)
+        # alpha_min=0.01 ensures encoder MUST inject some signal
+        # alpha_max=0.3 prevents excessive distortion
+        self.alpha_raw = nn.Parameter(torch.tensor(0.0))  # Will be transformed
+        self.alpha_min = 0.01
+        self.alpha_max = 0.3
 
     def forward(
         self,
@@ -273,15 +443,13 @@ class Encoder(nn.Module):
 
         # 1. Audio feature extraction
         audio_feat = self.audio_encoder(audio)  # [B, C, T]
-        T_feat = audio_feat.shape[-1]
 
-        # 2. Message projection & expansion
-        msg_feat = self.message_fc(message)  # [B, C]
-        msg_feat = msg_feat.unsqueeze(-1).expand(-1, -1, T_feat)  # [B, C, T]
-
-        # 3. Fusion (concatenate + conv)
-        fused = torch.cat([audio_feat, msg_feat], dim=1)  # [B, 2C, T]
-        fused = self.fusion_conv(fused)  # [B, C, T]
+        # 2. Cross-modal fusion (replaces simple expand)
+        # 강화된 message-audio 상호작용
+        fused = self.cross_modal_fusion(audio_feat, message)  # [B, C, T]
+        
+        # 3. Post-fusion refinement
+        fused = self.fusion_refine(fused)  # [B, C, T]
 
         # 4. Residual refinement
         for block in self.residual_blocks:
@@ -297,8 +465,13 @@ class Encoder(nn.Module):
         if perturbation.shape[-1] != T:
             perturbation = F.interpolate(perturbation, size=T, mode='linear', align_corners=False)
 
-        # tanh로 범위 제한 + scale
-        perturbation = torch.tanh(perturbation) * self.alpha
+        # Compute clamped alpha (CRITICAL: prevents vanishing to zero)
+        # sigmoid maps (-inf, inf) → (0, 1), then scale to [alpha_min, alpha_max]
+        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(self.alpha_raw)
+        
+        # tanh로 범위 제한 + clamped scale
+        # Small scaling factor (0.1) on tanh output for finer control
+        perturbation = 0.1 * torch.tanh(perturbation) * alpha
 
         # 원본 + 섭동
         watermarked = audio + perturbation
@@ -374,20 +547,25 @@ class Decoder(nn.Module):
         self.se_block = SEBlock(hidden_channels[-1])
 
         # =============================================
-        # 3. Global Pooling (가변 길이 지원)
+        # 3. Temporal Bit Extractor (Replaces global pooling)
         # =============================================
-
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-
+        # AdaptiveAvgPool1d(1) 대신 temporal 정보 보존하는 구조
+        
+        self.bit_extractor = TemporalBitExtractor(
+            in_channels=hidden_channels[-1],
+            num_bits=message_dim
+        )
+        
+        # Legacy classifier removed - TemporalBitExtractor handles classification
         # =============================================
-        # 4. Message Classifier
+        # 4. Message Classifier (REMOVED - integrated into TemporalBitExtractor)
         # =============================================
-
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_channels[-1], hidden_channels[-1]),
+        # Keeping a simple refinement layer for compatibility
+        self.classifier_refine = nn.Sequential(
+            nn.Linear(message_dim, message_dim * 2),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.1),
-            nn.Linear(hidden_channels[-1], message_dim),
+            nn.Linear(message_dim * 2, message_dim),
             # nn.Sigmoid() 제거: 수치적 안정성을 위해 로짓(Logit)을 직접 출력하고 
             # 손실 함수에서 binary_cross_entropy_with_logits를 사용함.
         )
@@ -412,12 +590,12 @@ class Decoder(nn.Module):
         # 3. Channel attention
         features = self.se_block(features)
 
-        # 4. Global pooling (가변 길이 → 고정 길이)
-        pooled = self.global_pool(features)  # [B, C, 1]
-        pooled = pooled.squeeze(-1)  # [B, C]
+        # 4. Temporal bit extraction (replaces global pooling)
+        # 각 비트가 특정 temporal region에서 추출됨
+        bit_logits = self.bit_extractor(features)  # [B, 128]
 
-        # 5. Classification
-        logits = self.classifier(pooled)  # [B, 128]
+        # 5. Refinement (residual connection)
+        logits = bit_logits + self.classifier_refine(bit_logits)  # [B, 128]
 
         return logits
 
