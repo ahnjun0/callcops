@@ -145,16 +145,19 @@ class SEBlock(nn.Module):
 
 class CrossModalFusionBlock(nn.Module):
     """
-    Cross-Modal Fusion Block for Audio-Message Interaction
-    ========================================================
+    Cross-Modal Fusion Block for Audio-Message Interaction (Memory Efficient)
+    ==========================================================================
     
-    기존 단순 expand() 대신 학습된 projection + attention으로
-    message와 audio feature 간 강한 상호작용 유도.
+    O(T) 복잡도의 Linear Attention으로 메모리 효율적 구현.
+    Audio [B, C, T]가 Global Message Vector [B, C, 1]에 attend.
     
     구조:
-    1. Message → Temporal Projection (학습된 확장)
-    2. Cross-Attention: Audio가 Message를 query
-    3. Gated Fusion: 두 modality 결합
+    1. Message → Global Vector Projection [B, C, 1]
+    2. Linear Attention: Audio가 Global Message를 query (O(T) not O(T²))
+    3. Bit Pattern Modulation: 128비트 패턴 주입
+    4. Gated Fusion: 두 modality 결합
+    
+    Memory: [B, T, 1] attention map instead of [B, T, T]
     """
     
     def __init__(self, audio_channels: int, message_dim: int = 128):
@@ -162,8 +165,9 @@ class CrossModalFusionBlock(nn.Module):
         
         self.audio_channels = audio_channels
         self.message_dim = message_dim
+        self.head_dim = audio_channels // 4
         
-        # Message를 audio와 같은 차원으로 projection
+        # Message를 Global Vector로 projection [B, 128] → [B, C]
         self.message_proj = nn.Sequential(
             nn.Linear(message_dim, audio_channels),
             nn.LeakyReLU(0.2, inplace=True),
@@ -177,10 +181,20 @@ class CrossModalFusionBlock(nn.Module):
             kernel_size=1, bias=False
         )
         
-        # Cross-attention: Audio queries Message
-        self.query_proj = nn.Conv1d(audio_channels, audio_channels // 4, kernel_size=1)
-        self.key_proj = nn.Linear(audio_channels, audio_channels // 4)
+        # Linear Attention: Audio queries Global Message (O(T) complexity)
+        # Query: from audio features [B, C, T] → [B, head_dim, T]
+        self.query_proj = nn.Conv1d(audio_channels, self.head_dim, kernel_size=1)
+        
+        # Key & Value: from GLOBAL message vector [B, C] → [B, head_dim] / [B, C]
+        # NOT from expanded [B, C, T] - this is the key difference!
+        self.key_proj = nn.Linear(audio_channels, self.head_dim)
         self.value_proj = nn.Linear(audio_channels, audio_channels)
+        
+        # Per-position modulation (content-aware gating)
+        self.position_gate = nn.Sequential(
+            nn.Conv1d(audio_channels, audio_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
         
         # Gated fusion
         self.gate = nn.Sequential(
@@ -198,35 +212,45 @@ class CrossModalFusionBlock(nn.Module):
     ) -> torch.Tensor:
         B, C, T = audio_feat.shape
         
-        # 1. Global message context (broadcast across time)
+        # 1. Global message projection (single vector, NOT expanded)
         msg_global = self.message_proj(message)  # [B, C]
-        msg_global = msg_global.unsqueeze(-1).expand(-1, -1, T)  # [B, C, T]
         
         # 2. Bit-wise temporal patterns
-        # 각 비트를 temporal axis에 spread하여 고유한 패턴 생성
-        msg_bits = message.unsqueeze(-1)  # [B, 128, 1]
-        msg_bits = msg_bits.expand(-1, -1, T)  # [B, 128, T]
+        msg_bits = message.unsqueeze(-1).expand(-1, -1, T)  # [B, 128, T]
         bit_patterns = self.bit_pattern_conv(msg_bits)  # [B, C, T]
         
-        # 3. Cross-attention: Audio가 Message 정보를 선택적으로 attend
-        Q = self.query_proj(audio_feat)  # [B, C//4, T]
-        K = self.key_proj(msg_global.permute(0, 2, 1))  # [B, T, C//4]
-        V = self.value_proj(msg_global.permute(0, 2, 1))  # [B, T, C]
+        # 3. Linear Attention: Audio attends to GLOBAL message (O(T) complexity)
+        # Query from audio: [B, head_dim, T]
+        Q = self.query_proj(audio_feat)  # [B, head_dim, T]
         
-        # Attention scores
-        attn = torch.bmm(Q.permute(0, 2, 1), K.permute(0, 2, 1))  # [B, T, T]
-        attn = attn / (C // 4) ** 0.5
-        attn = F.softmax(attn, dim=-1)
+        # Key & Value from GLOBAL message vector (shape [B, C], NOT [B, C, T])
+        K = self.key_proj(msg_global)    # [B, head_dim]
+        V = self.value_proj(msg_global)  # [B, C]
         
-        attended = torch.bmm(attn, V).permute(0, 2, 1)  # [B, C, T]
+        # Attention scores: each audio position attends to the single global message
+        # Q: [B, head_dim, T] → permute → [B, T, head_dim]
+        # K: [B, head_dim] → unsqueeze → [B, head_dim, 1]
+        # Result: [B, T, 1] - each of T positions has ONE attention weight
+        attn = torch.bmm(Q.permute(0, 2, 1), K.unsqueeze(-1))  # [B, T, 1]
+        attn = attn / (self.head_dim ** 0.5)
+        attn = torch.sigmoid(attn)  # Sigmoid for single-target attention (not softmax)
         
-        # 4. Gated fusion
-        combined = torch.cat([audio_feat, attended + bit_patterns], dim=1)  # [B, 2C, T]
+        # Attended value: broadcast V [B, C] across T positions, modulated by attn [B, T, 1]
+        # V: [B, C] → [B, C, 1] → [B, C, T] via broadcast
+        # attn: [B, T, 1] → [B, 1, T] for channel-wise multiplication
+        attended = V.unsqueeze(-1) * attn.permute(0, 2, 1)  # [B, C, T]
+        
+        # 4. Content-aware position gating
+        pos_gate = self.position_gate(audio_feat)  # [B, C, T]
+        modulated = pos_gate * (attended + bit_patterns)
+        
+        # 5. Gated fusion
+        combined = torch.cat([audio_feat, modulated], dim=1)  # [B, 2C, T]
         gate = self.gate(combined)  # [B, C, T]
         
-        fused = gate * audio_feat + (1 - gate) * (attended + bit_patterns)
+        fused = gate * audio_feat + (1 - gate) * modulated
         
-        # 5. Output projection
+        # 6. Output projection
         output = self.output_conv(torch.cat([fused, audio_feat], dim=1))
         output = self.norm(output)
         
