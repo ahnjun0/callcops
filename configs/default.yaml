@@ -38,20 +38,19 @@ model:
 # batch_size 32, num_workers 16 -> batch_size 24, num_workers 4 (메모리 절약, 줄이지 않으면 OOM 발생)
 training:
   batch_size: 24             # 실행 스크립트 설정값
-  learning_rate: 0.00005     # 3e-5 → 5e-5 (L1 loss 추가로 안정화됨)
+  learning_rate: 0.00001     # 5e-5 → 1e-5 (안정화)
   num_workers: 4            # 실행 스크립트 설정값
   adam_betas: [0.5, 0.9]
   epochs: 100
   grad_clip: 1.0
   use_amp: true              # Mixed Precision (BF16 적용됨)
 
-  # 손실 함수 가중치 (SNR 우선 설정 v2)
-  # 목표: BER < 5%, SNR > 30dB
-  # 해결: L1 waveform loss 추가로 SNR 직접 최적화
-  lambda_bit: 5.0            # L_BCE (비트 정확도)
-  lambda_audio: 10.0         # L_Mel (Mel 스펙트로그램)
-  lambda_stft: 5.0           # L_STFT (STFT 스펙트로그램)
-  lambda_l1: 30.0            # L1 Waveform (SNR 직접 최적화) - 30으로 조정
+  # 손실 함수 가중치 (Audio Priority for Smooth Perturbation)
+  # 목표: 소리가 깨지지 않게(Smooth) 먼저 학습하고, 비트는 천천히 채움
+  lambda_bit: 2.0            # 5.0 → 2.0 (비트 압박 완화)
+  lambda_audio: 50.0         # 10.0 → 50.0 (음질 최우선)
+  lambda_stft: 10.0          # 5.0 → 10.0 (스펙트럼 보존)
+  lambda_l1: 1.0             # 30.0 → 1.0 (L1 과다 억제 방지, Mel로 대체)
   lambda_adv: 0.05           # L_GAN (안정성)
   lambda_det: 0.1            # L_Det (탐지 정확도)
 

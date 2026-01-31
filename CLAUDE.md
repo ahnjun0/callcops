@@ -31,7 +31,7 @@ CallCops is a real-time audio watermarking system for Korean telephony authentic
 | Attempt | Config | Result | Notes |
 |---------|--------|--------|-------|
 | v1 | lambda_bit=50, audio=0.01, no codec | Very high SNR (100dB) | Mode collapse, no watermark |
-| v2 | Clamped alpha [0.01, 0.3] | BER improved | Still high SNR |
+| v2 | `Clamped Alpha` | Forces perturbation [0.6, 1.0] | `rtaw_net.py:421` | Still high SNR |
 | v3 | Curriculum learning 3-phase | Unstable | Loss oscillation |
 | v4 | Frame-wise encoder (40ms/bit) | Better BER | Architecture change |
 | v5 | lambda_l1=50, audio=10, L1 loss | Loss diverged | L1 too strong |
@@ -118,6 +118,11 @@ Watermarked [B,1,T] = Original + Perturbation
     │  - Output: [B, num_frames] probabilities │
     │         │                                │
     │         ▼                                │
+    │  Alpha [0.6, 1.0] (Train: 1.0, Eval: 0.6)│
+    │  - Prevents spikes by enforcing smooth   │
+    │    deformation over larger amplitude     │
+    │         │                                │
+    │         ▼                                │
     │  128-bit Aggregation                     │
     │  - Average bits with same (i % 128)      │
     └─────────────────────────────────────────┘
@@ -143,10 +148,10 @@ Watermarked [B,1,T] = Original + Perturbation
 ### Current Settings (configs/default.yaml)
 
 ```yaml
-lambda_bit: 5.0      # BCE loss for bit accuracy
-lambda_audio: 10.0   # Mel spectrogram loss
-lambda_stft: 5.0     # Multi-resolution STFT loss
-lambda_l1: 30.0      # Direct L1 waveform loss (SNR)
+lambda_bit: 2.0      # Reduced to prioritize audio quality first
+lambda_audio: 50.0   # Significantly increased for smooth perturbations
+lambda_stft: 10.0    # Increased for spectral fidelity
+lambda_l1: 1.0       # Reduced to avoid conflict with Mel loss
 lambda_adv: 0.05     # GAN adversarial loss
 lambda_det: 0.1      # Detection confidence loss
 ```

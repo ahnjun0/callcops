@@ -415,12 +415,20 @@ class Encoder(nn.Module):
 
         self.output_conv = nn.Conv1d(hidden_channels[0], 1, kernel_size=7, padding=3)
 
-        # Perturbation scale (학습 가능)
-        # 작은 perturbation으로 시작하여 음질 보존
-        # 0.1 * alpha 범위: [0.001, 0.03] - 매우 작은 perturbation
-        self.alpha_raw = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5 → α≈0.155 초기값
-        self.alpha_min = 0.01   # 최소 강도
-        self.alpha_max = 0.3    # 최대 강도
+        # [cite_start]논문 사양: alpha는 [0.6, 1.0] 범위 권장 [cite: 209]
+        self.alpha_min = 0.6
+        self.alpha_max = 1.0
+        
+        # 학습 시에는 1.0으로 고정하여 강력하게 학습시키고, 
+        # 추론(Inference) 시 0.6으로 낮추는 것이 논문의 전략입니다.
+        self.register_buffer('alpha', torch.tensor(1.0)) # Default to training mode value
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode:
+            self.alpha.fill_(1.0)
+        else:
+            self.alpha.fill_(0.6) 
 
     def forward(
         self,
@@ -462,13 +470,10 @@ class Encoder(nn.Module):
         if perturbation.shape[-1] != T:
             perturbation = F.interpolate(perturbation, size=T, mode='linear', align_corners=False)
 
-        # Clamped alpha (학습 가능, [0.6, 1.0] 범위)
-        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(self.alpha_raw)
-        
-        # 논문 수식: x̂ = x + α * δ
-        # tanh는 perturbation을 [-1, 1]로 제한
-        # alpha는 워터마크 강도 조절 (0.6~1.0)
-        perturbation = torch.tanh(perturbation) * alpha * 0.1  # 0.1은 초기 안정화용
+        # [cite_start]논문 수식 반영: x̂ = x + alpha * delta [cite: 210]
+        # tanh로 섭동의 범위를 [-1, 1]로 제한한 후 alpha를 곱함
+        # 임의의 '0.1' 곱셈은 제거하여 모델이 Loss를 통해 스스로 강도를 조절하게 함
+        perturbation = torch.tanh(perturbation) * self.alpha
 
         # 원본 + 섭동
         watermarked = audio + perturbation
