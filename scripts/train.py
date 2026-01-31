@@ -505,6 +505,7 @@ def train(
             lambda_adv=training_config.get('lambda_adv', 0.1),
             lambda_det=training_config.get('lambda_det', 0.5),
             lambda_stft=training_config.get('lambda_stft', 2.0),
+            lambda_l1=training_config.get('lambda_l1', 10.0),  # NEW: Direct L1 loss for SNR
             sample_rate=config.get('audio', {}).get('sample_rate', 8000)
         ).to(device)
 

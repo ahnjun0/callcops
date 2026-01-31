@@ -38,20 +38,21 @@ model:
 # batch_size 32, num_workers 16 -> batch_size 24, num_workers 4 (메모리 절약, 줄이지 않으면 OOM 발생)
 training:
   batch_size: 24             # 실행 스크립트 설정값
-  learning_rate: 0.00003     # 1e-4 → 3e-5 (진동 방지, 안정적 수렴)
+  learning_rate: 0.00005     # 3e-5 → 5e-5 (L1 loss 추가로 안정화됨)
   num_workers: 4            # 실행 스크립트 설정값
   adam_betas: [0.5, 0.9]
   epochs: 100
   grad_clip: 1.0
   use_amp: true              # Mixed Precision (BF16 적용됨)
 
-  # 손실 함수 가중치 (SNR 우선 설정)
+  # 손실 함수 가중치 (SNR 우선 설정 v2)
   # 목표: BER < 5%, SNR > 30dB
-  # 현재 문제: SNR 17dB에서 정체, BER 진동
-  lambda_bit: 5.0            # L_BCE - 10 → 5로 하향 (비트보다 음질 우선)
-  lambda_audio: 25.0         # L_Mel - 10 → 25로 상향! (SNR 목표 달성)
-  lambda_stft: 10.0          # L_STFT - 5 → 10으로 상향 (주파수 정밀도)
-  lambda_adv: 0.05           # L_GAN - 0.1 → 0.05 (안정성)
+  # 해결: L1 waveform loss 추가로 SNR 직접 최적화
+  lambda_bit: 5.0            # L_BCE (비트 정확도)
+  lambda_audio: 10.0         # L_Mel (Mel 스펙트로그램)
+  lambda_stft: 5.0           # L_STFT (STFT 스펙트로그램)
+  lambda_l1: 30.0            # L1 Waveform (SNR 직접 최적화) - 30으로 조정
+  lambda_adv: 0.05           # L_GAN (안정성)
   lambda_det: 0.1            # L_Det (탐지 정확도)
 
 # 코덱 시뮬레이터

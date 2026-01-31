@@ -507,6 +507,7 @@ class CallCopsLoss(nn.Module):
         lambda_adv: float = 0.1,
         lambda_det: float = 0.5,
         lambda_stft: float = 2.0,
+        lambda_l1: float = 10.0,   # NEW: Direct waveform L1 loss for SNR
         sample_rate: int = 8000,
         use_focal_loss: bool = False,
         gan_mode: str = 'lsgan'
@@ -518,6 +519,7 @@ class CallCopsLoss(nn.Module):
         self.lambda_adv = lambda_adv
         self.lambda_det = lambda_det
         self.lambda_stft = lambda_stft
+        self.lambda_l1 = lambda_l1  # NEW: Direct waveform L1 loss
 
         # Individual loss components
         self.bit_loss = BitAccuracyLoss(use_focal=use_focal_loss)
@@ -567,6 +569,9 @@ class CallCopsLoss(nn.Module):
         losses['stft_sc'] = sc_loss
         losses['stft_mag'] = mag_loss
         losses['stft'] = sc_loss + mag_loss
+        
+        # NEW: Direct L1 waveform loss (directly improves SNR)
+        losses['l1'] = F.l1_loss(pred_audio, target_audio)
 
         # 3. Detection Loss
         has_watermark = torch.ones_like(detection_pred)
@@ -583,6 +588,7 @@ class CallCopsLoss(nn.Module):
             self.lambda_bit * losses['bit'] +
             self.lambda_audio * losses['mel'] +
             self.lambda_stft * losses['stft'] +
+            self.lambda_l1 * losses['l1'] +    # NEW: L1 waveform loss
             self.lambda_det * losses['detection'] +
             self.lambda_adv * losses['adv_g']
         )
