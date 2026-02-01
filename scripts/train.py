@@ -538,16 +538,14 @@ def train(
             mode='min',          # val_loss를 최소화
             factor=0.5,          # LR을 절반으로 감소
             patience=3,          # 3 에포크 동안 개선 없으면 발동
-            min_lr=1e-7,         # 최소 LR 하한
-            verbose=True         # LR 변경 시 출력
+            min_lr=1e-7          # 최소 LR 하한
         )
         scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
             opt_d,
             mode='min',
             factor=0.5,
             patience=3,
-            min_lr=1e-7,
-            verbose=True
+            min_lr=1e-7
         )
 
         # ========================================
