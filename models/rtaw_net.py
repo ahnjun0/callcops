@@ -419,16 +419,18 @@ class Encoder(nn.Module):
         self.alpha_min = 0.6
         self.alpha_max = 1.0
         
-        # 학습 시에는 1.0으로 고정하여 강력하게 학습시키고, 
-        # 추론(Inference) 시 0.6으로 낮추는 것이 논문의 전략입니다.
-        self.register_buffer('alpha', torch.tensor(1.0)) # Default to training mode value
+        # Fine-tuning 모드: Train/Eval 모두 0.6으로 고정하여 투명성 우선
+        # (학습 초기에는 1.0이었으나, Epoch 5 이후 fine-tuning에서는 0.6 고정)
+        self.register_buffer('alpha', torch.tensor(0.6))
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if mode:
-            self.alpha.fill_(1.0)
-        else:
-            self.alpha.fill_(0.6) 
+        # Fine-tuning에서는 alpha를 0.6으로 고정 (train/eval 동일)
+        # 필요시 아래 주석 해제하여 train=1.0, eval=0.6 복원 가능
+        # if mode:
+        #     self.alpha.fill_(1.0)
+        # else:
+        #     self.alpha.fill_(0.6) 
 
     def forward(
         self,

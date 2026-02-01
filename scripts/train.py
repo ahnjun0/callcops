@@ -528,6 +528,29 @@ def train(
         )
 
         # ========================================
+        # 3.5 LR Scheduler (ReduceLROnPlateau)
+        # ========================================
+        # 선택 이유: 이 학습에서는 Val Loss 변동폭이 매우 큼 (32~76)
+        # - CosineAnnealing: 고정된 스케줄이므로 갑작스런 spike에 대응 불가
+        # - ReduceLROnPlateau: 실제 성능 기반으로 LR 조정, 불안정한 학습에 적합
+        scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
+            opt_g,
+            mode='min',          # val_loss를 최소화
+            factor=0.5,          # LR을 절반으로 감소
+            patience=3,          # 3 에포크 동안 개선 없으면 발동
+            min_lr=1e-7,         # 최소 LR 하한
+            verbose=True         # LR 변경 시 출력
+        )
+        scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
+            opt_d,
+            mode='min',
+            factor=0.5,
+            patience=3,
+            min_lr=1e-7,
+            verbose=True
+        )
+
+        # ========================================
         # 4. Codec Simulator (Optional)
         # ========================================
         codec_sim = None
@@ -589,13 +612,19 @@ def train(
             trainer.history['train_ber'].append(train_metrics['ber'])
             trainer.history['val_ber'].append(val_metrics['ber'])
 
+            # LR Scheduler Step (ReduceLROnPlateau: val_loss 기반)
+            scheduler_g.step(val_metrics['loss'])
+            scheduler_d.step(val_metrics['loss'])
+            current_lr = opt_g.param_groups[0]['lr']
+
             # Summary
             summary_text = (
                 f"✅ **Epoch {epoch+1}/{num_epochs}**\n"
                 f"📉 Train Loss: `{train_metrics['loss_total']:.4f}`\n"
                 f"📉 Val Loss: `{val_metrics['loss']:.4f}`\n"
                 f"🎯 **Val BER**: `{val_metrics['ber']:.4f}`\n"
-                f"🔊 Val SNR: `{val_metrics['snr']:.1f}dB`"
+                f"🔊 Val SNR: `{val_metrics['snr']:.1f}dB`\n"
+                f"📊 LR: `{current_lr:.2e}`"
             )
             
             print(f"\n{summary_text.replace('**', '').replace('`', '')}")
