@@ -34,22 +34,22 @@ model:
     resolutions: [64, 128, 256]
     channels: [32, 64, 128, 256]
 
-# 학습 설정 (Fine-tuning 최적화)
+# 학습 설정 (Quality-Centric: SNR 최우선)
 training:
   batch_size: 24
-  learning_rate: 0.000005   # 1e-5 → 5e-6 (안정적 fine-tuning)
+  learning_rate: 0.000005   # 5e-6 (안정적 fine-tuning)
   num_workers: 4
   adam_betas: [0.5, 0.9]
-  epochs: 50                # 100 → 50 (fine-tuning은 짧게)
-  grad_clip: 0.5            # 1.0 → 0.5 (Gradient spike 방지)
+  epochs: 50
+  grad_clip: 0.5            # Gradient spike 방지
   use_amp: true
 
-  # 손실 함수 가중치 (Audio Priority++)
-  # SNR 개선에 집중, BER은 BCH 보정 범위 내 유지
-  lambda_bit: 2.0           # 유지 (BER 7.3%로 이미 양호)
-  lambda_audio: 100.0       # 50 → 100 (2x, 음질 최우선)
-  lambda_stft: 20.0         # 10 → 20 (2x, 스펙트럼 보존)
-  lambda_l1: 10.0           # 1 → 10 (10x, 적당한 L1 압력)
+  # 손실 함수 가중치 (Quality-Centric: SNR > 20dB 목표)
+  # BER은 BCH(511,128)가 10%까지 허용하므로 5-8% 허용
+  lambda_bit: 1.0           # 2.0 → 1.0 (비트 압박 대폭 완화)
+  lambda_audio: 200.0       # 100 → 200 (Mel Loss 최우선)
+  lambda_stft: 30.0         # 20 → 30 (스펙트럼 보존 강화)
+  lambda_l1: 50.0           # 10 → 50 (L1 적당히 상향, 300은 위험)
   lambda_adv: 0.05          # 유지
   lambda_det: 0.1           # 유지
 

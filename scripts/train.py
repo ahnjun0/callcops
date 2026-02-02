@@ -633,6 +633,21 @@ def train(
             scheduler_d.step(val_metrics['loss'])
             current_lr = opt_g.param_groups[0]['lr']
 
+            # ========================================
+            # Dynamic Weight Controller (로컬 미니마 탈출)
+            # ========================================
+            # BER이 너무 낮으면 → bit 압박 완화, audio에 집중
+            if val_metrics['ber'] < 0.02:  # BER < 2%
+                old_lambda_bit = loss_fn.lambda_bit
+                loss_fn.lambda_bit = max(0.1, loss_fn.lambda_bit * 0.8)
+                print(f"  🎛️ Dynamic: lambda_bit {old_lambda_bit:.2f} → {loss_fn.lambda_bit:.2f} (BER over-optimized)")
+            
+            # SNR이 너무 낮으면 → audio 압박 강화
+            if val_metrics['snr'] < 15.0:  # SNR < 15dB
+                old_lambda_audio = loss_fn.lambda_audio
+                loss_fn.lambda_audio = min(500.0, loss_fn.lambda_audio * 1.1)
+                print(f"  🎛️ Dynamic: lambda_audio {old_lambda_audio:.1f} → {loss_fn.lambda_audio:.1f} (SNR too low)")
+
             # Summary
             summary_text = (
                 f"✅ **Epoch {epoch+1}/{num_epochs}**\n"
